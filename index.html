@@ -1,0 +1,1035 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="theme-color" content="#0e1f0e"/>
+<meta name="description" content="Mise Recipes — Kitchen recipe database"/>
+<title>Mise Recipes</title>
+<link rel="manifest" href="manifest.json"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js" crossorigin="anonymous"></script>
+<style>
+/*
+  Mise Recipes
+  Created by Josh — All rights reserved.
+*/
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth}
+body{
+  background:linear-gradient(160deg,#0e1f0e 0%,#111a0f 30%,#16180e 60%,#1a1208 100%);
+  background-attachment:fixed;
+  color:#f0ede8;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  min-height:100vh;
+  overflow-x:hidden;
+}
+button,input,select,textarea{font-family:inherit;max-width:100%}
+input,select,textarea{min-width:0}
+::placeholder{color:rgba(184,200,168,0.35)}
+select option{background:#162016;color:#f0ede8}
+:focus-visible{outline:2px solid rgba(212,232,184,0.5);outline-offset:2px}
+@media print{
+  body{background:white !important;color:#111 !important}
+  .no-print{display:none !important}
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+/*
+  Mise Recipes — Standalone kitchen recipe database
+  Created by Josh / All rights reserved.
+*/
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ── Config — change per deployment ───────────────────────────────────────────
+const PROPERTY      = "1hotel-melbourne";
+const PROPERTY_NAME = "1 Hotel Melbourne";
+
+// Supabase
+const SB_URL  = "https://xfrspqumcsxwxmjqsalg.supabase.co";
+const SB_KEY  = "sb_publishable_3G8P3sjDyfR_7I-ISUiBbA_ahoLxRSq";
+const MAGIC_LINK_FN = SB_URL + "/functions/v1/send-magic-link";
+const PARSE_FN      = SB_URL + "/functions/v1/parse-recipe";
+
+// ── Supabase client — handles auth, token refresh, session persistence ────────
+const sbClient = window.supabase.createClient(SB_URL, SB_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true },
+});
+
+// Module-level session — kept in sync via onAuthStateChange
+// Used to inject the user's token into raw fetch calls so RLS works
+let _session = null;
+
+function authHdrs() {
+  const token = _session?.access_token || SB_KEY;
+  return { "Content-Type":"application/json","apikey":SB_KEY,"Authorization":"Bearer "+token };
+}
+
+// ── Supabase DB helpers ───────────────────────────────────────────────────────
+async function dbFetch(path){
+  const r = await fetch(SB_URL+"/rest/v1/"+path,{headers:authHdrs()});
+  if(!r.ok) throw new Error("Failed to load.");
+  return r.json();
+}
+async function dbPost(table,body){
+  const r = await fetch(SB_URL+"/rest/v1/"+table,{
+    method:"POST",
+    headers:Object.assign({},authHdrs(),{"Prefer":"return=representation"}),
+    body:JSON.stringify(body)
+  });
+  if(!r.ok) throw new Error("Save failed. Check connection.");
+  return r.json();
+}
+async function dbPatch(table,id,body){
+  const r = await fetch(SB_URL+"/rest/v1/"+table+"?id=eq."+id,{
+    method:"PATCH",
+    headers:Object.assign({},authHdrs(),{"Prefer":"return=representation"}),
+    body:JSON.stringify(body)
+  });
+  if(!r.ok) throw new Error("Update failed. Check connection.");
+  return r.json();
+}
+async function dbDelete(table,id){
+  const r = await fetch(SB_URL+"/rest/v1/"+table+"?id=eq."+id,{method:"DELETE",headers:authHdrs()});
+  if(!r.ok) throw new Error("Delete failed. Check connection.");
+}
+function fetchRecipes(){
+  return dbFetch("recipes?property=eq."+encodeURIComponent(PROPERTY)+"&order=category.asc,name.asc&select=*");
+}
+
+// ── Magic link sender — calls edge function, never touches the allowlist ──────
+async function sendMagicLink(email){
+  const redirectTo = window.location.href.split("#")[0]; // current page without hash
+  const r = await fetch(MAGIC_LINK_FN,{
+    method:"POST",
+    headers:{"Content-Type":"application/json","apikey":SB_KEY},
+    body:JSON.stringify({email,redirectTo})
+  });
+  if(!r.ok) throw new Error("Could not send link. Try again.");
+  // Always succeeds server-side — don't reveal if email was found
+}
+
+// ── Parse recipe via edge function ───────────────────────────────────────────
+async function parseRecipeFromText(text){
+  const r = await fetch(PARSE_FN,{
+    method:"POST",
+    headers:{"Content-Type":"application/json","apikey":SB_KEY,"Authorization":"Bearer "+SB_KEY},
+    body:JSON.stringify({text})
+  });
+  if(!r.ok){
+    const err = await r.json().catch(()=>({error:"Parse service unavailable."}));
+    throw new Error(err.error||"Parse failed. Try again.");
+  }
+  const data = await r.json();
+  if(data.error) throw new Error(data.error);
+  return data.recipe;
+}
+
+// ── Validate AI response ──────────────────────────────────────────────────────
+function validateParsed(r){
+  if(!r||typeof r!=="object") throw new Error("Unexpected response from parser.");
+  return {
+    name        : typeof r.name==="string"         ? r.name.slice(0,200)         : "",
+    category    : typeof r.category==="string"     ? r.category.slice(0,100)     : "",
+    yield_amount: typeof r.yield_amount==="string" ? r.yield_amount.slice(0,50)  : "",
+    yield_unit  : typeof r.yield_unit==="string"   ? r.yield_unit.slice(0,50)    : "portions",
+    ingredients : Array.isArray(r.ingredients)
+      ? r.ingredients.slice(0,100).map(i=>({
+          name  : typeof i.name==="string"   ? i.name.slice(0,200)   : "",
+          amount: typeof i.amount==="string" ? i.amount.slice(0,50)  : "",
+          unit  : typeof i.unit==="string"   ? i.unit.slice(0,50)    : "",
+        }))
+      : [{name:"",amount:"",unit:""}],
+    method: Array.isArray(r.method)
+      ? r.method.slice(0,50).map(s=>typeof s==="string"?s.slice(0,2000):"")
+      : [""],
+  };
+}
+
+// ── Sanitise form before save ─────────────────────────────────────────────────
+function sanitise(form){
+  return Object.assign({},form,{
+    name        : form.name.trim(),
+    category    : form.category.trim(),
+    yield_amount: form.yield_amount.trim(),
+    yield_unit  : form.yield_unit.trim(),
+    ingredients : form.ingredients
+      .map(i=>({name:i.name.trim(),amount:i.amount.trim(),unit:i.unit.trim()}))
+      .filter(i=>i.name),
+    method: form.method.map(s=>s.trim()).filter(s=>s),
+  });
+}
+
+// ── HTML escape ───────────────────────────────────────────────────────────────
+function esc(str){
+  return String(str||"")
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+
+// ── Recipe scaling ────────────────────────────────────────────────────────────
+function formatNum(n){
+  if(Number.isInteger(n)) return String(n);
+  return String(parseFloat((Math.round(n*1000)/1000).toFixed(3)));
+}
+function scaleAmount(amountStr,multiplier){
+  if(multiplier===1) return amountStr;
+  const s=String(amountStr||"").trim();
+  if(!s) return s;
+  const frac=s.match(/^(\d+)\s*\/\s*(\d+)$/);
+  if(frac) return formatNum((parseInt(frac[1])/parseInt(frac[2]))*multiplier);
+  const num=parseFloat(s);
+  if(!isNaN(num)&&String(num)===s.replace(/,/g,".")) return formatNum(num*multiplier);
+  return s;
+}
+function scaleYield(yieldStr,multiplier){
+  if(multiplier===1) return yieldStr;
+  const s=String(yieldStr||"").trim();
+  const num=parseFloat(s);
+  return !isNaN(num)?formatNum(num*multiplier):s;
+}
+
+// ── Print ─────────────────────────────────────────────────────────────────────
+function printRecipe(recipe,scale){
+  scale=scale||1;
+  const win=window.open("","_blank");
+  if(!win){alert("Allow pop-ups for this site to print.");return;}
+  const ings=recipe.ingredients||[];
+  const steps=recipe.method||[];
+  const scaledYield=scaleYield(recipe.yield_amount,scale);
+  const meta=[
+    recipe.category?esc(recipe.category):null,
+    scaledYield?"Yield: "+esc(scaledYield)+" "+esc(recipe.yield_unit||""):null,
+    scale>1?"×"+scale+" batch":null,
+  ].filter(Boolean).join(" &nbsp;·&nbsp; ");
+  win.document.write(`<!DOCTYPE html><html><head>
+<meta charset="UTF-8"/><title>${esc(recipe.name)}${scale>1?" (×"+scale+")":""}</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#111;padding:2.5rem;max-width:680px}
+h1{font-size:1.75rem;font-weight:700;margin-bottom:.3rem}
+.meta{font-size:.8rem;color:#777;margin-bottom:1.75rem;padding-bottom:.875rem;border-bottom:2px solid #e8e8e8}
+h3{font-size:.65rem;letter-spacing:.14em;text-transform:uppercase;color:#999;margin-bottom:.75rem;margin-top:1.5rem;padding-bottom:.4rem;border-bottom:1px solid #eee}
+.ing{display:flex;justify-content:space-between;align-items:baseline;padding:.45rem 0;border-bottom:1px solid #f4f4f4;font-size:.9rem}
+.ing .n{color:#222}.ing .a{font-weight:600;color:#111;white-space:nowrap;margin-left:1.5rem}
+.step{display:flex;gap:1rem;margin-bottom:.875rem;font-size:.9rem;line-height:1.6}
+.step-n{font-weight:700;color:#bbb;flex-shrink:0;min-width:1.5rem}
+@media print{body{padding:.5rem}}
+</style></head><body>
+<h1>${esc(recipe.name)}</h1>
+<p class="meta">${meta}</p>
+<h3>Ingredients</h3>
+${ings.map(i=>`<div class="ing"><span class="n">${esc(i.name)}</span><span class="a">${esc(scaleAmount(i.amount,scale))}${i.unit?" "+esc(i.unit):""}</span></div>`).join("")}
+<h3>Method</h3>
+${steps.map((s,i)=>`<div class="step"><span class="step-n">${i+1}.</span><span>${esc(s)}</span></div>`).join("")}
+</body></html>`);
+  win.document.close();win.focus();setTimeout(()=>win.print(),400);
+}
+
+// ── Demo recipe ───────────────────────────────────────────────────────────────
+const DEMO_RECIPES=[{
+  id:"demo-1",property:PROPERTY,
+  name:"Lime Curd",category:"Base",
+  yield_amount:"3575",yield_unit:"g",
+  ingredients:[
+    {name:"Lime Juice",        amount:"400",  unit:"g"},
+    {name:"Makrut Lime Juice", amount:"400",  unit:"g"},
+    {name:"Caster Sugar",      amount:"900",  unit:"g"},
+    {name:"Butter",            amount:"1125", unit:"g"},
+    {name:"Whole Eggs",        amount:"750",  unit:"g"},
+  ],
+  method:[
+    "Combine all ingredients in the Thermomix.",
+    "Set to 80°C, speed 3.5, and run for 11 minutes.",
+    "Check consistency — curd should coat the back of a spoon.",
+    "Pass through a fine sieve and cool over an ice bath.",
+    "Store refrigerated in an airtight container.",
+  ],
+  _isDemo:true,
+}];
+
+// ── Colours ───────────────────────────────────────────────────────────────────
+const C={
+  card:"rgba(10,20,8,0.45)",cardHov:"rgba(10,20,8,0.65)",
+  cardBorder:"#3a5a2a",field:"rgba(10,20,8,0.55)",fieldBorder:"#3a5a2a",
+  tPrimary:"#ffffff",tBody:"#f0ede8",tSub:"#b8c8a8",tMuted:"rgba(184,200,168,0.45)",
+  accent:"#d4e8b8",accentDk:"#0a1a08",green:"#7ad86a",amber:"#d4a860",rust:"#e07858",
+  divider:"rgba(58,90,42,0.4)",
+};
+
+// ── Styles ────────────────────────────────────────────────────────────────────
+const st={
+  wrap:{maxWidth:"680px",margin:"0 auto",padding:"1.5rem 1.25rem"},
+  center:{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"2rem 1.25rem"},
+  eyebrow:{fontSize:".65rem",letterSpacing:".2em",textTransform:"uppercase",color:C.tSub},
+  h1:{fontSize:"1.6rem",fontWeight:"700",color:C.tPrimary,lineHeight:"1.1"},
+  searchWrap:{position:"relative",marginBottom:"1.25rem"},
+  searchInput:{width:"100%",background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:"1rem",padding:".875rem 1rem .875rem 3rem",color:C.tBody,fontSize:".9rem",outline:"none"},
+  searchIcon:{position:"absolute",left:"1rem",top:"50%",transform:"translateY(-50%)",color:C.tSub,pointerEvents:"none"},
+  filterRow:{display:"flex",gap:".5rem",flexWrap:"wrap",marginBottom:"1.5rem"},
+  chip:{padding:".4rem .875rem",borderRadius:".625rem",fontSize:".75rem",fontWeight:"500",border:"1px solid "+C.cardBorder,background:C.card,color:C.tSub,cursor:"pointer"},
+  chipOn:{background:C.accent,color:C.accentDk,borderColor:C.accent,fontWeight:"600"},
+  recipeCard:{width:"100%",background:C.card,border:"1px solid "+C.cardBorder,borderRadius:"1rem",padding:"1.1rem 1.25rem",marginBottom:".625rem",cursor:"pointer",textAlign:"left",display:"flex",alignItems:"center",justifyContent:"space-between",gap:"1rem"},
+  rName:{fontSize:".95rem",fontWeight:"600",color:C.tPrimary,marginBottom:".2rem"},
+  rMeta:{fontSize:".72rem",color:C.tSub},
+  catBadge:{fontSize:".65rem",letterSpacing:".08em",textTransform:"uppercase",padding:".25rem .625rem",borderRadius:".375rem",background:"rgba(58,90,42,0.4)",color:C.tSub,flexShrink:"0",whiteSpace:"nowrap"},
+  backBtn:{background:"none",border:"none",color:C.tSub,fontSize:".85rem",cursor:"pointer",padding:".25rem 0",display:"flex",alignItems:"center",gap:".4rem"},
+  detailTitle:{fontSize:"1.5rem",fontWeight:"700",color:C.tPrimary,marginBottom:".3rem"},
+  ingTable:{width:"100%",background:C.card,border:"1px solid "+C.cardBorder,borderRadius:"1rem",overflow:"hidden",marginBottom:"1rem"},
+  ingRow:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:".75rem 1.1rem",borderBottom:"1px solid "+C.divider},
+  ingName:{fontSize:".875rem",color:C.tBody},
+  ingAmt:{fontSize:".875rem",fontWeight:"600",color:C.tPrimary,textAlign:"right",marginLeft:"1rem",whiteSpace:"nowrap"},
+  stepCard:{display:"flex",gap:"1rem",padding:"1rem 1.1rem",background:C.card,border:"1px solid "+C.cardBorder,borderRadius:"1rem",marginBottom:".625rem"},
+  stepNum:{fontSize:"1.1rem",fontWeight:"700",color:C.accent,flexShrink:"0",lineHeight:"1.4",minWidth:"1.5rem"},
+  stepTxt:{fontSize:".875rem",lineHeight:"1.6",color:C.tBody},
+  sectionLbl:{fontSize:".65rem",letterSpacing:".12em",textTransform:"uppercase",color:C.tSub,marginBottom:".75rem",display:"block"},
+  btnP:{padding:".875rem 1.5rem",borderRadius:".875rem",background:C.accent,color:C.accentDk,fontSize:".875rem",fontWeight:"700",border:"none",cursor:"pointer",whiteSpace:"nowrap"},
+  btnGhost:{padding:".625rem 1.25rem",borderRadius:".875rem",border:"1px solid "+C.cardBorder,background:"transparent",color:C.tSub,fontSize:".8rem",cursor:"pointer",whiteSpace:"nowrap"},
+  btnDanger:{padding:".625rem 1.25rem",borderRadius:".875rem",border:"1px solid #7a3820",background:"transparent",color:C.rust,fontSize:".8rem",cursor:"pointer",whiteSpace:"nowrap"},
+  btnDangerSolid:{padding:".625rem 1.25rem",borderRadius:".875rem",border:"none",background:"#7a3820",color:"#ffd0c0",fontSize:".8rem",cursor:"pointer",fontWeight:"600",whiteSpace:"nowrap"},
+  btnPrint:{padding:".625rem 1.1rem",borderRadius:".875rem",border:"1px solid "+C.cardBorder,background:"transparent",color:C.tSub,fontSize:".8rem",cursor:"pointer",display:"flex",alignItems:"center",gap:".375rem",whiteSpace:"nowrap"},
+  lbl:{fontSize:".65rem",letterSpacing:".12em",textTransform:"uppercase",color:C.tSub,display:"block",marginBottom:".5rem"},
+  input:{width:"100%",background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:".75rem",padding:".75rem 1rem",color:C.tBody,fontSize:".875rem",outline:"none"},
+  textarea:{width:"100%",background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:".75rem",padding:".75rem 1rem",color:C.tBody,fontSize:".875rem",outline:"none",resize:"vertical",minHeight:"70px"},
+  ingOuter:{background:"rgba(10,20,8,0.4)",border:"1px solid rgba(58,90,42,0.35)",borderRadius:".75rem",padding:".625rem .75rem",marginBottom:".5rem"},
+  ingTopRow:{display:"flex",gap:".5rem",marginBottom:".4rem",alignItems:"center"},
+  ingBotRow:{display:"flex",gap:".5rem",alignItems:"center"},
+  ingInName:{flex:"1",background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:".5rem",padding:".5rem .75rem",color:C.tBody,fontSize:".85rem",outline:"none",minWidth:"0"},
+  ingInAmt:{flex:"1",background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:".5rem",padding:".5rem .75rem",color:C.tBody,fontSize:".85rem",outline:"none",minWidth:"0"},
+  ingInUnit:{flex:"1.2",background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:".5rem",padding:".5rem .75rem",color:C.tBody,fontSize:".85rem",outline:"none",minWidth:"0"},
+  rmBtn:{background:"none",border:"none",color:"rgba(100,120,90,0.7)",fontSize:"1.4rem",cursor:"pointer",lineHeight:"1",flexShrink:"0",padding:"0 .2rem"},
+  stepEditRow:{display:"flex",gap:".5rem",alignItems:"flex-start",marginBottom:".5rem"},
+  stepN2:{color:C.accent,fontWeight:"700",fontSize:".9rem",minWidth:"1.4rem",paddingTop:".7rem",flexShrink:"0"},
+  addRowBtn:{width:"100%",padding:".75rem",borderRadius:".75rem",border:"1px dashed rgba(90,128,80,0.45)",background:"transparent",color:C.tSub,fontSize:".825rem",cursor:"pointer",marginTop:".25rem"},
+  overlay:{position:"fixed",inset:"0",background:"rgba(6,12,6,0.88)",zIndex:"100",display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"1.5rem 1rem",overflowY:"auto",overflowX:"hidden"},
+  modal:{width:"100%",maxWidth:"560px",background:"#131f10",border:"1px solid #3a5a2a",borderRadius:"1.25rem",padding:"1.5rem",boxSizing:"border-box"},
+  uploadBox:{border:"2px dashed rgba(90,128,80,0.5)",borderRadius:"1rem",padding:"2rem 1.5rem",textAlign:"center",cursor:"pointer",marginBottom:"1.25rem",background:"rgba(10,20,8,0.3)"},
+  emptyState:{textAlign:"center",padding:"4rem 1rem",color:C.tSub},
+  catLbl:{fontSize:".65rem",letterSpacing:".15em",textTransform:"uppercase",color:C.tSub,marginBottom:".625rem",marginTop:".25rem"},
+  toast:{position:"fixed",bottom:"1.5rem",left:"50%",transform:"translateX(-50%)",background:"#1e3a18",border:"1px solid #4a8a3a",borderRadius:".875rem",padding:".75rem 1.25rem",fontSize:".85rem",color:C.accent,zIndex:"200",whiteSpace:"nowrap",pointerEvents:"none"},
+  errBox:{background:"rgba(80,20,10,0.25)",border:"1px solid rgba(180,80,60,0.35)",borderRadius:".75rem",padding:".625rem .875rem"},
+  userRow:{display:"flex",alignItems:"center",gap:".75rem",padding:".875rem 1rem",background:C.card,border:"1px solid "+C.cardBorder,borderRadius:".875rem",marginBottom:".5rem"},
+};
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function Toast({msg}){return msg?React.createElement("div",{style:st.toast},msg):null;}
+
+// ── Inline delete confirm ─────────────────────────────────────────────────────
+function DeleteConfirm({name,onConfirm,onCancel,deleting,err}){
+  return (
+    <div style={{background:"rgba(80,20,10,0.3)",border:"1px solid #7a3820",borderRadius:"1rem",padding:"1rem 1.1rem",marginBottom:"1rem"}}>
+      <p style={{fontSize:".875rem",color:"#ffd0c0",marginBottom:".875rem"}}>
+        Delete <strong>"{name}"</strong>? This cannot be undone.
+      </p>
+      {err&&<p style={{fontSize:".78rem",color:C.rust,marginBottom:".625rem"}}>⚠ {err}</p>}
+      <div style={{display:"flex",gap:".625rem"}}>
+        <button style={Object.assign({},st.btnDangerSolid,{opacity:deleting?0.5:1})}
+          onClick={onConfirm} disabled={deleting}>{deleting?"Deleting…":"Yes, delete"}</button>
+        <button style={st.btnGhost} onClick={onCancel} disabled={deleting}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Ingredient editor row ─────────────────────────────────────────────────────
+function IngRow({ing,idx,onChange,onRemove}){
+  return (
+    <div style={st.ingOuter}>
+      <div style={st.ingTopRow}>
+        <input style={st.ingInName} placeholder="Ingredient name" value={ing.name}
+          onChange={e=>onChange(idx,"name",e.target.value)}/>
+        <button style={st.rmBtn} onClick={()=>onRemove(idx)}>×</button>
+      </div>
+      <div style={st.ingBotRow}>
+        <input style={st.ingInAmt} placeholder="Amount" value={ing.amount}
+          onChange={e=>onChange(idx,"amount",e.target.value)}/>
+        <input style={st.ingInUnit} placeholder="Unit (g, ml, tsp…)" value={ing.unit}
+          onChange={e=>onChange(idx,"unit",e.target.value)}/>
+      </div>
+    </div>
+  );
+}
+
+// ── Recipe form ───────────────────────────────────────────────────────────────
+const CAT_OPTS=["Entrée","Main","Dessert","Sauce","Base","Snack","Bread","Pastry","Beverage","Other"];
+const BLANK={name:"",category:"",yield_amount:"",yield_unit:"portions",
+  ingredients:[{name:"",amount:"",unit:""}],method:[""]};
+
+function RecipeForm({initial,categories,onSave,onCancel}){
+  const [form,setForm]     = useState(()=>initial?Object.assign({},BLANK,initial):BLANK);
+  const [saving,setSaving] = useState(false);
+  const [err,setErr]       = useState("");
+  const [parsing,setParsing]   = useState(false);
+  const [parseErr,setParseErr] = useState("");
+  const [parsed,setParsed]     = useState(false);
+  const fileRef = useRef(null);
+
+  const isDirty=!!(form.name.trim()||form.ingredients.some(i=>i.name.trim())||form.method.some(s=>s.trim()));
+  const set=(k,v)=>setForm(f=>Object.assign({},f,{[k]:v}));
+  const setIng=(i,k,v)=>setForm(f=>{const a=[...f.ingredients];a[i]=Object.assign({},a[i],{[k]:v});return Object.assign({},f,{ingredients:a});});
+  const addIng=()=>{if(form.ingredients.length>=100)return;setForm(f=>Object.assign({},f,{ingredients:[...f.ingredients,{name:"",amount:"",unit:""}]}));};
+  const rmIng=i=>setForm(f=>Object.assign({},f,{ingredients:f.ingredients.filter((_,j)=>j!==i)}));
+  const setStep=(i,v)=>setForm(f=>{const a=[...f.method];a[i]=v;return Object.assign({},f,{method:a});});
+  const addStep=()=>{if(form.method.length>=50)return;setForm(f=>Object.assign({},f,{method:[...f.method,""]}));};
+  const rmStep=i=>setForm(f=>Object.assign({},f,{method:f.method.filter((_,j)=>j!==i)}));
+
+  function handleCancel(){
+    if(isDirty&&!window.confirm("Discard changes?"))return;
+    onCancel();
+  }
+
+  async function handleDocxUpload(file){
+    if(!file)return;
+    if(!file.name.toLowerCase().endsWith(".docx")){setParseErr("Please upload a .docx file.");return;}
+    if(file.size>10*1024*1024){setParseErr("File too large — max 10MB.");return;}
+    if(isDirty&&!window.confirm("This will replace the current form. Continue?"))return;
+    setParsing(true);setParseErr("");setParsed(false);
+    try{
+      const arrayBuffer=await file.arrayBuffer();
+      const result=await mammoth.extractRawText({arrayBuffer});
+      const text=result.value;
+      if(!text.trim())throw new Error("No readable text found in document.");
+      const raw=await parseRecipeFromText(text);
+      setForm(validateParsed(raw));
+      setParsed(true);
+    }catch(e){
+      setParseErr(e.message||"Could not parse document. Fill in manually below.");
+    }
+    setParsing(false);
+    if(fileRef.current)fileRef.current.value="";
+  }
+
+  async function handleSave(){
+    setErr("");
+    const clean=sanitise(form);
+    if(!clean.name){setErr("Recipe name is required.");return;}
+    if(!clean.ingredients.length){setErr("Add at least one ingredient.");return;}
+    if(!clean.method.length){setErr("Add at least one method step.");return;}
+    setSaving(true);
+    try{await onSave(clean);}
+    catch(e){setErr(e.message||"Save failed.");setSaving(false);}
+  }
+
+  const allCats=[...new Set([...CAT_OPTS,...categories])].sort();
+
+  return (
+    <div>
+      {!initial&&(
+        <div>
+          <div
+            style={Object.assign({},st.uploadBox,
+              parsing?{opacity:.6,cursor:"wait"}:
+              parsed?{borderColor:"rgba(90,180,70,0.6)",background:"rgba(10,30,8,0.4)"}:{})}
+            onClick={()=>!parsing&&fileRef.current&&fileRef.current.click()}
+            onDragOver={e=>e.preventDefault()}
+            onDrop={e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)handleDocxUpload(f);}}>
+            <input ref={fileRef} type="file" accept=".docx" style={{display:"none"}}
+              onChange={e=>e.target.files[0]&&handleDocxUpload(e.target.files[0])}/>
+            <p style={{fontSize:"1.4rem",marginBottom:".4rem"}}>{parsing?"⏳":parsed?"✅":"📄"}</p>
+            <p style={{fontSize:".875rem",fontWeight:"600",color:parsed?C.green:C.tBody,marginBottom:".2rem"}}>
+              {parsing?"Reading document…":parsed?"Recipe imported — review and save below":"Upload a Word doc to auto-fill"}
+            </p>
+            <p style={{fontSize:".75rem",color:C.tSub}}>
+              {parsing?"Parsing with AI — a few seconds…":"Drag & drop or tap · .docx only · max 10MB"}
+            </p>
+          </div>
+          {parseErr&&(
+            <div style={Object.assign({},st.errBox,{marginBottom:".875rem"})}>
+              <p style={{fontSize:".8rem",color:"#ffd0c0"}}>⚠ {parseErr}</p>
+              <p style={{fontSize:".75rem",color:C.tSub,marginTop:".3rem"}}>Fill in the recipe manually below.</p>
+            </div>
+          )}
+          {parsed&&<div style={{height:"1px",background:C.divider,marginBottom:"1.25rem"}}/>}
+        </div>
+      )}
+      <div style={{marginBottom:"1rem"}}>
+        <label style={st.lbl}>Recipe Name *</label>
+        <input style={Object.assign({},st.input,err&&!form.name.trim()?{borderColor:C.rust}:{})}
+          value={form.name} onChange={e=>set("name",e.target.value)}
+          placeholder="e.g. Beef Wellington" autoFocus={!initial}/>
+      </div>
+      <div style={{display:"flex",gap:".75rem",marginBottom:"1rem",flexWrap:"wrap"}}>
+        <div style={{flex:"1",minWidth:"140px"}}>
+          <label style={st.lbl}>Category</label>
+          <select style={st.input} value={form.category} onChange={e=>set("category",e.target.value)}>
+            <option value="">Select…</option>
+            {allCats.map(c=><option key={c} value={c}>{c}</option>)}
+          </select>
+        </div>
+        <div style={{flex:"1",minWidth:"140px"}}>
+          <label style={st.lbl}>Yield</label>
+          <div style={{display:"flex",gap:".4rem"}}>
+            <input style={Object.assign({},st.input,{flex:"1",minWidth:"0"})}
+              value={form.yield_amount} onChange={e=>set("yield_amount",e.target.value)} placeholder="e.g. 10"/>
+            <input style={Object.assign({},st.input,{flex:"1.4",minWidth:"0"})}
+              value={form.yield_unit} onChange={e=>set("yield_unit",e.target.value)} placeholder="portions"/>
+          </div>
+        </div>
+      </div>
+      <div style={{marginBottom:"1rem"}}>
+        <label style={st.lbl}>Ingredients *</label>
+        {form.ingredients.map((ing,i)=>(
+          <IngRow key={i} ing={ing} idx={i} onChange={setIng} onRemove={rmIng}/>
+        ))}
+        <button style={st.addRowBtn} onClick={addIng}>+ Add ingredient</button>
+      </div>
+      <div style={{marginBottom:"1rem"}}>
+        <label style={st.lbl}>Method *</label>
+        {form.method.map((step,i)=>(
+          <div key={i} style={st.stepEditRow}>
+            <span style={st.stepN2}>{i+1}.</span>
+            <textarea style={Object.assign({},st.textarea,{flex:"1",minHeight:"60px"})}
+              value={step} onChange={e=>setStep(i,e.target.value)} placeholder={"Step "+(i+1)}/>
+            <button style={Object.assign({},st.rmBtn,{paddingTop:".65rem"})} onClick={()=>rmStep(i)}>×</button>
+          </div>
+        ))}
+        <button style={st.addRowBtn} onClick={addStep}>+ Add step</button>
+      </div>
+      {err&&<div style={Object.assign({},st.errBox,{marginBottom:".875rem"})}><p style={{fontSize:".8rem",color:"#ffd0c0"}}>⚠ {err}</p></div>}
+      <div style={{display:"flex",gap:".75rem",flexWrap:"wrap",paddingTop:".25rem"}}>
+        <button style={Object.assign({},st.btnP,{opacity:saving||parsing?0.5:1})}
+          onClick={handleSave} disabled={saving||parsing}>{saving?"Saving…":"Save Recipe"}</button>
+        <button style={st.btnGhost} onClick={handleCancel} disabled={saving}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Recipe detail ─────────────────────────────────────────────────────────────
+function RecipeDetail({recipe,isAdmin,onBack,onEdit,onDelete}){
+  const [confirmDelete,setConfirmDelete]=useState(false);
+  const [deleting,setDeleting]=useState(false);
+  const [deleteErr,setDeleteErr]=useState("");
+  const [scale,setScale]=useState(1);
+  const ings=recipe.ingredients||[];
+  const steps=recipe.method||[];
+
+  useEffect(()=>setScale(1),[recipe.id]);
+
+  async function handleDelete(){
+    setDeleting(true);setDeleteErr("");
+    try{await onDelete(recipe);}
+    catch(e){setDeleteErr(e.message||"Delete failed. Try again.");setDeleting(false);}
+  }
+
+  return (
+    <div>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1.5rem",flexWrap:"wrap",gap:".75rem"}} className="no-print">
+        <button style={st.backBtn} onClick={onBack}>← All Recipes</button>
+        <div style={{display:"flex",gap:".5rem",flexWrap:"wrap"}}>
+          <button style={st.btnPrint} onClick={()=>printRecipe(recipe,scale)}>⎙ Print</button>
+          {isAdmin&&!recipe._isDemo&&!confirmDelete&&<>
+            <button style={st.btnGhost} onClick={()=>onEdit(recipe)}>Edit</button>
+            <button style={st.btnDanger} onClick={()=>setConfirmDelete(true)}>Delete</button>
+          </>}
+        </div>
+      </div>
+
+      {recipe._isDemo&&(
+        <div style={{background:"rgba(212,168,60,0.12)",border:"1px solid rgba(212,168,60,0.3)",borderRadius:".875rem",padding:".875rem 1.1rem",marginBottom:"1.25rem",fontSize:".8rem",color:C.amber}}>
+          Demo recipe. Once your database is set up, add it for real via <strong>+ New Recipe</strong>.
+        </div>
+      )}
+      {confirmDelete&&(
+        <DeleteConfirm name={recipe.name} onConfirm={handleDelete}
+          onCancel={()=>{setConfirmDelete(false);setDeleteErr("");}}
+          deleting={deleting} err={deleteErr}/>
+      )}
+      {recipe.category&&(
+        <span style={Object.assign({},st.catBadge,{display:"inline-block",marginBottom:".6rem"})}>{recipe.category}</span>
+      )}
+      <h1 style={st.detailTitle}>{recipe.name}</h1>
+
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1.75rem",flexWrap:"wrap",gap:".75rem"}}>
+        {(recipe.yield_amount||recipe.yield_unit)?(
+          <p style={{display:"flex",alignItems:"center",gap:".4rem",fontSize:".8rem",color:C.tSub}}>
+            <span style={{color:C.accent}}>◎</span>
+            Yield:&nbsp;<strong style={{color:C.tPrimary}}>{scaleYield(recipe.yield_amount,scale)} {recipe.yield_unit}</strong>
+            {scale>1&&<span style={{fontSize:".7rem",color:C.amber}}>×{scale}</span>}
+          </p>
+        ):<div/>}
+        {ings.some(i=>!isNaN(parseFloat(i.amount)))&&(
+          <div style={{display:"flex",alignItems:"center",gap:".375rem"}} className="no-print">
+            <span style={{fontSize:".65rem",letterSpacing:".1em",textTransform:"uppercase",color:C.tMuted,marginRight:".15rem"}}>Scale</span>
+            {[1,2,3].map(n=>(
+              <button key={n} onClick={()=>setScale(n)} style={{
+                padding:".35rem .75rem",borderRadius:".625rem",fontSize:".8rem",fontWeight:"600",
+                border:"1px solid "+(scale===n?C.accent:C.cardBorder),
+                background:scale===n?C.accent:"transparent",
+                color:scale===n?C.accentDk:C.tSub,cursor:"pointer",
+              }}>×{n}</button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {ings.length>0&&(
+        <div style={{marginBottom:"1.75rem"}}>
+          <span style={st.sectionLbl}>Ingredients</span>
+          <div style={st.ingTable}>
+            {ings.map((ing,i)=>{
+              const scaled=scaleAmount(ing.amount,scale);
+              const changed=scale>1&&scaled!==ing.amount;
+              return(
+                <div key={i} style={Object.assign({},st.ingRow,i===ings.length-1?{borderBottom:"none"}:{})}>
+                  <span style={st.ingName}>{ing.name}</span>
+                  <span style={Object.assign({},st.ingAmt,changed?{color:C.accent}:{})}>
+                    {scaled}{ing.unit?" "+ing.unit:""}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          {scale>1&&<p style={{fontSize:".72rem",color:C.tMuted,marginTop:".5rem",textAlign:"right"}}>Amounts shown ×{scale} — original recipe ×1</p>}
+        </div>
+      )}
+      {steps.length>0&&(
+        <div style={{marginBottom:"2rem"}}>
+          <span style={st.sectionLbl}>Method</span>
+          {steps.map((step,i)=>(
+            <div key={i} style={st.stepCard}>
+              <span style={st.stepNum}>{i+1}</span>
+              <span style={st.stepTxt}>{step}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── User management (admin only) ──────────────────────────────────────────────
+function UserManagement({onClose}){
+  const [users,setUsers]     = useState([]);
+  const [loading,setLoading] = useState(true);
+  const [err,setErr]         = useState("");
+  const [newEmail,setNewEmail] = useState("");
+  const [newRole,setNewRole]   = useState("staff");
+  const [adding,setAdding]     = useState(false);
+  const [addErr,setAddErr]     = useState("");
+
+  useEffect(()=>{loadUsers();},[]);
+
+  async function loadUsers(){
+    setLoading(true);setErr("");
+    try{
+      const {data,error}=await sbClient.from("allowed_emails").select("*").order("email");
+      if(error)throw error;
+      setUsers(data||[]);
+    }catch(e){setErr("Could not load users.");}
+    setLoading(false);
+  }
+
+  async function handleAdd(){
+    const email=newEmail.trim().toLowerCase();
+    if(!email||!email.includes("@")){setAddErr("Enter a valid email address.");return;}
+    setAdding(true);setAddErr("");
+    try{
+      const {error}=await sbClient.from("allowed_emails").insert({email,role:newRole});
+      if(error){
+        if(error.code==="23505") throw new Error("That email is already in the list.");
+        throw error;
+      }
+      setNewEmail("");setNewRole("staff");
+      await loadUsers();
+    }catch(e){setAddErr(e.message||"Could not add user.");}
+    setAdding(false);
+  }
+
+  async function handleRoleChange(id,role){
+    const {error}=await sbClient.from("allowed_emails").update({role}).eq("id",id);
+    if(!error)setUsers(prev=>prev.map(u=>u.id===id?Object.assign({},u,{role}):u));
+  }
+
+  async function handleRemove(id,email){
+    if(!window.confirm("Remove "+email+" from access list?"))return;
+    const {error}=await sbClient.from("allowed_emails").delete().eq("id",id);
+    if(!error)setUsers(prev=>prev.filter(u=>u.id!==id));
+  }
+
+  return (
+    <div style={st.overlay} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={st.modal}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1.5rem"}}>
+          <h2 style={{fontSize:"1.1rem",fontWeight:"700",color:C.tPrimary}}>Manage Access</h2>
+          <button style={st.btnGhost} onClick={onClose}>Close</button>
+        </div>
+
+        {/* Add user */}
+        <div style={{background:"rgba(10,20,8,0.4)",border:"1px solid rgba(58,90,42,0.35)",borderRadius:".875rem",padding:"1rem",marginBottom:"1.25rem"}}>
+          <label style={Object.assign({},st.lbl,{marginBottom:".75rem"})}>Add person</label>
+          <div style={{display:"flex",gap:".5rem",flexWrap:"wrap",marginBottom:".5rem"}}>
+            <input style={Object.assign({},st.input,{flex:"2",minWidth:"160px"})}
+              placeholder="email@example.com" value={newEmail}
+              onChange={e=>{setNewEmail(e.target.value);setAddErr("");}}
+              onKeyDown={e=>{if(e.key==="Enter")handleAdd();}}/>
+            <select style={Object.assign({},st.input,{flex:"1",minWidth:"100px"})}
+              value={newRole} onChange={e=>setNewRole(e.target.value)}>
+              <option value="staff">Staff</option>
+              <option value="admin">Admin</option>
+            </select>
+          </div>
+          {addErr&&<p style={{fontSize:".75rem",color:C.rust,marginBottom:".5rem"}}>⚠ {addErr}</p>}
+          <button style={Object.assign({},st.btnP,{opacity:adding?0.5:1})}
+            onClick={handleAdd} disabled={adding}>{adding?"Adding…":"Add"}</button>
+        </div>
+
+        {/* User list */}
+        <label style={st.lbl}>Current access</label>
+        {loading&&<p style={{fontSize:".8rem",color:C.tSub,padding:".75rem 0"}}>Loading…</p>}
+        {err&&<p style={{fontSize:".8rem",color:C.rust,padding:".75rem 0"}}>⚠ {err}</p>}
+        {!loading&&users.length===0&&<p style={{fontSize:".8rem",color:C.tSub,padding:".75rem 0"}}>No users yet.</p>}
+        {!loading&&users.map(u=>(
+          <div key={u.id} style={st.userRow}>
+            <span style={{flex:"1",fontSize:".85rem",color:C.tBody,minWidth:"0",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{u.email}</span>
+            <select
+              style={{background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:".5rem",padding:".35rem .6rem",color:C.tSub,fontSize:".75rem",outline:"none",cursor:"pointer",flexShrink:"0"}}
+              value={u.role}
+              onChange={e=>handleRoleChange(u.id,e.target.value)}>
+              <option value="staff">Staff</option>
+              <option value="admin">Admin</option>
+            </select>
+            <button style={Object.assign({},st.rmBtn,{fontSize:"1.2rem",color:C.rust})}
+              onClick={()=>handleRemove(u.id,u.email)}>×</button>
+          </div>
+        ))}
+        <p style={{fontSize:".7rem",color:C.tMuted,marginTop:"1rem"}}>
+          Changes take effect on next login. Removing a person revokes future access but does not end their current session.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+  // Auth state
+  const [authLoading,setAuthLoading] = useState(true);
+  const [session,setSession]         = useState(null);
+  const [userRole,setUserRole]       = useState(null);
+  const [userEmail,setUserEmail]     = useState(null);
+
+  // Login form state
+  const [loginEmail,setLoginEmail]   = useState("");
+  const [loginSent,setLoginSent]     = useState(false);
+  const [loginLoading,setLoginLoading] = useState(false);
+  const [loginErr,setLoginErr]       = useState("");
+
+  // App state
+  const [view,setView]           = useState("list");
+  const [recipes,setRecipes]     = useState([]);
+  const [dataLoading,setDataLoading] = useState(true);
+  const [fetchErr,setFetchErr]   = useState("");
+  const [retryCount,setRetry]    = useState(0);
+  const [search,setSearch]       = useState("");
+  const [filterCat,setFilter]    = useState("All");
+  const [selected,setSelected]   = useState(null);
+  const [showForm,setShowForm]   = useState(false);
+  const [editTarget,setEdit]     = useState(null);
+  const [showUsers,setShowUsers] = useState(false);
+  const [toast,setToast]         = useState("");
+
+  const isAdmin = userRole==="admin";
+
+  function showToast(msg){setToast(msg);setTimeout(()=>setToast(""),2500);}
+
+  // ── Auth init ───────────────────────────────────────────────────────────────
+  useEffect(()=>{
+    // Check initial session (handles magic link callback via URL hash automatically)
+    sbClient.auth.getSession().then(({data:{session}})=>{
+      _session=session;
+      setSession(session);
+      if(session){setUserEmail(session.user.email);fetchRole();}
+      else setAuthLoading(false);
+    });
+
+    // Keep session in sync
+    const {data:{subscription}}=sbClient.auth.onAuthStateChange((event,session)=>{
+      _session=session;
+      setSession(session);
+      if(session){setUserEmail(session.user.email);fetchRole();}
+      else{setUserRole(null);setUserEmail(null);setAuthLoading(false);}
+    });
+
+    return ()=>subscription.unsubscribe();
+  },[]);
+
+  async function fetchRole(){
+    try{
+      const {data}=await sbClient.rpc("get_user_role");
+      setUserRole(data||"staff");
+    }catch(e){
+      setUserRole("staff");
+    }
+    setAuthLoading(false);
+  }
+
+  async function handleLogin(){
+    const email=loginEmail.trim().toLowerCase();
+    if(!email||!email.includes("@")){setLoginErr("Enter a valid email address.");return;}
+    setLoginLoading(true);setLoginErr("");
+    try{await sendMagicLink(email);setLoginSent(true);}
+    catch(e){setLoginErr("Could not send link. Check your connection and try again.");}
+    setLoginLoading(false);
+  }
+
+  async function handleSignOut(){
+    await sbClient.auth.signOut();
+    setView("list");setSearch("");setFilter("All");
+    setSelected(null);setShowForm(false);setEdit(null);
+  }
+
+  // ── Data loading ────────────────────────────────────────────────────────────
+  const load=useCallback(async()=>{
+    setDataLoading(true);setFetchErr("");
+    try{
+      const data=await fetchRecipes();
+      setRecipes(data.length>0?data:DEMO_RECIPES);
+    }catch(e){
+      setRecipes(DEMO_RECIPES);
+      setFetchErr("Could not connect to database.");
+    }
+    setDataLoading(false);
+  },[]);
+
+  useEffect(()=>{if(session)load();},[session,retryCount]);
+
+  // ── Derived ─────────────────────────────────────────────────────────────────
+  const categories=["All",...[...new Set(recipes.filter(r=>!r._isDemo).map(r=>r.category).filter(Boolean))].sort()];
+  const filtered=recipes.filter(r=>{
+    const mc=filterCat==="All"||r.category===filterCat;
+    const q=search.trim().toLowerCase();
+    const ms=!q||r.name.toLowerCase().includes(q)||(r.category||"").toLowerCase().includes(q);
+    return mc&&ms;
+  });
+  const grouped=filtered.reduce((acc,r)=>{(acc[r.category||"Other"]=acc[r.category||"Other"]||[]).push(r);return acc;},{});
+  const sortedCats=Object.keys(grouped).sort();
+  const showLabels=filterCat==="All"&&!search.trim();
+
+  // ── CRUD ────────────────────────────────────────────────────────────────────
+  async function handleSave(form){
+    const payload=Object.assign({},form,{property:PROPERTY});
+    if(editTarget){
+      const [updated]=await dbPatch("recipes",editTarget.id,payload);
+      setRecipes(prev=>prev.map(r=>r.id===editTarget.id?updated:r));
+      setSelected(updated);
+      showToast("Recipe updated ✓");
+    }else{
+      const [created]=await dbPost("recipes",payload);
+      setRecipes(prev=>[...prev.filter(r=>!r._isDemo),created]);
+      showToast("Recipe saved ✓");
+    }
+    setShowForm(false);setEdit(null);
+  }
+  async function handleDelete(recipe){
+    await dbDelete("recipes",recipe.id);
+    setRecipes(prev=>prev.filter(r=>r.id!==recipe.id));
+    setSelected(null);setView("list");
+    showToast("Recipe deleted");
+  }
+  function openEdit(r){setEdit(r);setShowForm(true);setView("list");}
+
+  // ── Render: loading ─────────────────────────────────────────────────────────
+  if(authLoading) return (
+    <div style={st.center}>
+      <p style={{fontSize:".75rem",color:C.tSub,letterSpacing:".12em",textTransform:"uppercase"}}>Loading…</p>
+    </div>
+  );
+
+  // ── Render: login ───────────────────────────────────────────────────────────
+  if(!session) return (
+    <div style={st.center}>
+      <div style={{width:"100%",maxWidth:"340px"}}>
+        <p style={Object.assign({},st.eyebrow,{textAlign:"center",marginBottom:".5rem"})}>{PROPERTY_NAME}</p>
+        <h1 style={Object.assign({},st.h1,{textAlign:"center",marginBottom:".4rem"})}>Mise Recipes</h1>
+        <p style={{fontSize:".875rem",color:C.tSub,textAlign:"center",marginBottom:"2.5rem",fontStyle:"italic"}}>kitchen recipe database</p>
+
+        {!loginSent?(
+          <div>
+            <label style={st.lbl}>Email address</label>
+            <input
+              type="email"
+              style={Object.assign({},st.input,{marginBottom:".625rem"})}
+              placeholder="you@example.com"
+              value={loginEmail}
+              autoFocus
+              onChange={e=>{setLoginEmail(e.target.value);setLoginErr("");}}
+              onKeyDown={e=>{if(e.key==="Enter")handleLogin();}}
+            />
+            {loginErr&&<p style={{fontSize:".75rem",color:C.rust,marginBottom:".625rem"}}>⚠ {loginErr}</p>}
+            <button
+              style={Object.assign({},st.btnP,{width:"100%",opacity:loginLoading?0.5:1})}
+              onClick={handleLogin}
+              disabled={loginLoading}>
+              {loginLoading?"Sending…":"Send login link →"}
+            </button>
+            <p style={{fontSize:".72rem",color:C.tMuted,textAlign:"center",marginTop:"1.25rem"}}>
+              We'll send a one-time link to your email — no password needed.
+            </p>
+          </div>
+        ):(
+          <div style={{textAlign:"center"}}>
+            <p style={{fontSize:"2rem",marginBottom:"1rem"}}>📬</p>
+            <p style={{fontSize:".95rem",fontWeight:"600",color:C.tBody,marginBottom:".5rem"}}>Check your inbox</p>
+            <p style={{fontSize:".85rem",color:C.tSub,marginBottom:"1.75rem",lineHeight:"1.5"}}>
+              A login link has been sent to<br/>
+              <strong style={{color:C.tBody}}>{loginEmail}</strong>
+            </p>
+            <p style={{fontSize:".75rem",color:C.tMuted}}>
+              Link expires in 1 hour. Check spam if it doesn't arrive.
+            </p>
+            <button
+              style={Object.assign({},st.btnGhost,{marginTop:"1.5rem",width:"100%"})}
+              onClick={()=>{setLoginSent(false);setLoginEmail("");}}>
+              Use a different email
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  // ── Render: detail ──────────────────────────────────────────────────────────
+  if(view==="detail"&&selected) return (
+    <div style={{minHeight:"100vh"}}>
+      <div style={st.wrap}>
+        <RecipeDetail recipe={selected} isAdmin={isAdmin}
+          onBack={()=>setView("list")} onEdit={openEdit} onDelete={handleDelete}/>
+      </div>
+      <Toast msg={toast}/>
+    </div>
+  );
+
+  // ── Render: list ────────────────────────────────────────────────────────────
+  return (
+    <div style={{minHeight:"100vh"}}>
+      <div style={st.wrap}>
+
+        {/* Header */}
+        <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:"2rem",gap:"1rem",flexWrap:"wrap"}} className="no-print">
+          <div>
+            <p style={st.eyebrow}>{PROPERTY_NAME}</p>
+            <h1 style={st.h1}>Recipes</h1>
+          </div>
+          <div style={{display:"flex",gap:".5rem",alignItems:"center",flexWrap:"wrap"}}>
+            {isAdmin&&<>
+              <button style={st.btnP} onClick={()=>{setEdit(null);setShowForm(true);}}>+ New Recipe</button>
+              <button style={st.btnGhost} onClick={()=>setShowUsers(true)}>Manage Access</button>
+            </>}
+            <button style={st.btnGhost} onClick={handleSignOut} title={"Signed in as "+userEmail}>
+              Sign out
+            </button>
+          </div>
+        </div>
+
+        {/* Connection error */}
+        {fetchErr&&(
+          <div style={{background:"rgba(80,20,10,0.25)",border:"1px solid rgba(180,80,60,0.35)",borderRadius:".875rem",padding:".875rem 1rem",marginBottom:"1.25rem",display:"flex",alignItems:"center",justifyContent:"space-between",gap:"1rem",flexWrap:"wrap"}}>
+            <p style={{fontSize:".8rem",color:"#ffd0c0"}}>{fetchErr}</p>
+            <button style={st.btnGhost} onClick={()=>setRetry(r=>r+1)} disabled={dataLoading}>
+              {dataLoading?"Retrying…":"↺ Retry"}
+            </button>
+          </div>
+        )}
+
+        {/* Search */}
+        <div style={st.searchWrap} className="no-print">
+          <span style={st.searchIcon}>⌕</span>
+          <input style={st.searchInput} placeholder="Search recipes…" value={search}
+            onChange={e=>setSearch(e.target.value)}/>
+        </div>
+
+        {/* Category filters */}
+        {categories.length>1&&(
+          <div style={st.filterRow} className="no-print">
+            {categories.map(c=>(
+              <button key={c} style={Object.assign({},st.chip,filterCat===c?st.chipOn:{})}
+                onClick={()=>setFilter(c)}>{c}</button>
+            ))}
+          </div>
+        )}
+
+        {dataLoading&&<p style={{color:C.tSub,fontSize:".85rem",marginBottom:"1rem"}}>Loading…</p>}
+
+        {/* Empty state */}
+        {!dataLoading&&filtered.length===0&&(
+          <div style={st.emptyState}>
+            <p style={{fontSize:"2rem",marginBottom:".75rem"}}>🍃</p>
+            <p style={{fontWeight:"600",color:C.tBody,marginBottom:".4rem"}}>
+              {search||filterCat!=="All"?"No recipes found":"No recipes yet"}
+            </p>
+            <p style={{fontSize:".85rem"}}>
+              {search||filterCat!=="All"
+                ?<button style={{background:"none",border:"none",color:C.tSub,cursor:"pointer",textDecoration:"underline"}}
+                    onClick={()=>{setSearch("");setFilter("All");}}>Clear filters</button>
+                :isAdmin?"Add your first recipe above.":"Check back with your admin."
+              }
+            </p>
+          </div>
+        )}
+
+        {/* Recipe list */}
+        {!dataLoading&&sortedCats.map(cat=>(
+          <div key={cat} style={{marginBottom:showLabels?"1.75rem":0}}>
+            {showLabels&&<p style={st.catLbl}>{cat}</p>}
+            {(grouped[cat]||[]).map(r=>(
+              <button key={r.id} style={st.recipeCard}
+                onClick={()=>{setSelected(r);setView("detail");}}
+                onMouseEnter={e=>e.currentTarget.style.background=C.cardHov}
+                onMouseLeave={e=>e.currentTarget.style.background=C.card}>
+                <div style={{flex:"1",textAlign:"left",minWidth:"0"}}>
+                  <p style={st.rName}>
+                    {r.name}
+                    {r._isDemo&&<span style={{fontSize:".6rem",letterSpacing:".08em",textTransform:"uppercase",marginLeft:".6rem",padding:".15rem .45rem",borderRadius:".3rem",background:"rgba(212,168,60,0.2)",color:C.amber,verticalAlign:"middle"}}>Demo</span>}
+                  </p>
+                  <p style={st.rMeta}>
+                    {[r.yield_amount&&r.yield_unit?`Yield: ${r.yield_amount} ${r.yield_unit}`:null,
+                      r.ingredients&&r.ingredients.length>0?`${r.ingredients.length} ingredients`:null]
+                      .filter(Boolean).join(" · ")}
+                  </p>
+                </div>
+                {!showLabels&&r.category&&<span style={st.catBadge}>{r.category}</span>}
+                <span style={{color:C.tSub,fontSize:".9rem",flexShrink:"0",marginLeft:".5rem"}}>›</span>
+              </button>
+            ))}
+          </div>
+        ))}
+
+      </div>
+
+      {/* Recipe form modal */}
+      {showForm&&(
+        <div style={st.overlay}>
+          <div style={st.modal}>
+            <h2 style={{fontSize:"1.2rem",fontWeight:"700",color:C.tPrimary,marginBottom:"1.5rem"}}>
+              {editTarget?"Edit Recipe":"New Recipe"}
+            </h2>
+            <RecipeForm
+              initial={editTarget}
+              categories={categories.filter(c=>c!=="All")}
+              onSave={handleSave}
+              onCancel={()=>{setShowForm(false);setEdit(null);}}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* User management modal */}
+      {showUsers&&isAdmin&&<UserManagement onClose={()=>setShowUsers(false)}/>}
+
+      <Toast msg={toast}/>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App,null));
+</script>
+</body>
+</html>
