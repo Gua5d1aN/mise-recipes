@@ -11,7 +11,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" crossorigin="anonymous"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js" crossorigin="anonymous"></script>
 <style>
 /*
@@ -56,7 +55,6 @@ const PROPERTY_NAME = "1 Hotel Melbourne";
 const SB_URL  = "https://xfrspqumcsxwxmjqsalg.supabase.co";
 const SB_KEY  = "sb_publishable_3G8P3sjDyfR_7I-ISUiBbA_ahoLxRSq";
 const MAGIC_LINK_FN = SB_URL + "/functions/v1/send-magic-link";
-const PARSE_FN      = SB_URL + "/functions/v1/parse-recipe";
 
 // ── Supabase client — handles auth, token refresh, session persistence ────────
 const sbClient = window.supabase.createClient(SB_URL, SB_KEY, {
@@ -114,43 +112,6 @@ async function sendMagicLink(email){
   });
   if(!r.ok) throw new Error("Could not send link. Try again.");
   // Always succeeds server-side — don't reveal if email was found
-}
-
-// ── Parse recipe via edge function ───────────────────────────────────────────
-async function parseRecipeFromText(text){
-  const r = await fetch(PARSE_FN,{
-    method:"POST",
-    headers:{"Content-Type":"application/json","apikey":SB_KEY,"Authorization":"Bearer "+SB_KEY},
-    body:JSON.stringify({text})
-  });
-  if(!r.ok){
-    const err = await r.json().catch(()=>({error:"Parse service unavailable."}));
-    throw new Error(err.error||"Parse failed. Try again.");
-  }
-  const data = await r.json();
-  if(data.error) throw new Error(data.error);
-  return data.recipe;
-}
-
-// ── Validate AI response ──────────────────────────────────────────────────────
-function validateParsed(r){
-  if(!r||typeof r!=="object") throw new Error("Unexpected response from parser.");
-  return {
-    name        : typeof r.name==="string"         ? r.name.slice(0,200)         : "",
-    category    : typeof r.category==="string"     ? r.category.slice(0,100)     : "",
-    yield_amount: typeof r.yield_amount==="string" ? r.yield_amount.slice(0,50)  : "",
-    yield_unit  : typeof r.yield_unit==="string"   ? r.yield_unit.slice(0,50)    : "portions",
-    ingredients : Array.isArray(r.ingredients)
-      ? r.ingredients.slice(0,100).map(i=>({
-          name  : typeof i.name==="string"   ? i.name.slice(0,200)   : "",
-          amount: typeof i.amount==="string" ? i.amount.slice(0,50)  : "",
-          unit  : typeof i.unit==="string"   ? i.unit.slice(0,50)    : "",
-        }))
-      : [{name:"",amount:"",unit:""}],
-    method: Array.isArray(r.method)
-      ? r.method.slice(0,50).map(s=>typeof s==="string"?s.slice(0,2000):"")
-      : [""],
-  };
 }
 
 // ── Sanitise form before save ─────────────────────────────────────────────────
@@ -310,7 +271,6 @@ const st={
   addRowBtn:{width:"100%",padding:".75rem",borderRadius:".75rem",border:"1px dashed rgba(90,128,80,0.45)",background:"transparent",color:C.tSub,fontSize:".825rem",cursor:"pointer",marginTop:".25rem"},
   overlay:{position:"fixed",inset:"0",background:"rgba(6,12,6,0.88)",zIndex:"100",display:"flex",alignItems:"flex-start",justifyContent:"center",padding:"1.5rem 1rem",overflowY:"auto",overflowX:"hidden"},
   modal:{width:"100%",maxWidth:"560px",background:"#131f10",border:"1px solid #3a5a2a",borderRadius:"1.25rem",padding:"1.5rem",boxSizing:"border-box"},
-  uploadBox:{border:"2px dashed rgba(90,128,80,0.5)",borderRadius:"1rem",padding:"2rem 1.5rem",textAlign:"center",cursor:"pointer",marginBottom:"1.25rem",background:"rgba(10,20,8,0.3)"},
   emptyState:{textAlign:"center",padding:"4rem 1rem",color:C.tSub},
   catLbl:{fontSize:".65rem",letterSpacing:".15em",textTransform:"uppercase",color:C.tSub,marginBottom:".625rem",marginTop:".25rem"},
   toast:{position:"fixed",bottom:"1.5rem",left:"50%",transform:"translateX(-50%)",background:"#1e3a18",border:"1px solid #4a8a3a",borderRadius:".875rem",padding:".75rem 1.25rem",fontSize:".85rem",color:C.accent,zIndex:"200",whiteSpace:"nowrap",pointerEvents:"none"},
@@ -366,11 +326,6 @@ function RecipeForm({initial,categories,onSave,onCancel}){
   const [form,setForm]     = useState(()=>initial?Object.assign({},BLANK,initial):BLANK);
   const [saving,setSaving] = useState(false);
   const [err,setErr]       = useState("");
-  const [parsing,setParsing]   = useState(false);
-  const [parseErr,setParseErr] = useState("");
-  const [parsed,setParsed]     = useState(false);
-  const fileRef = useRef(null);
-
   const isDirty=!!(form.name.trim()||form.ingredients.some(i=>i.name.trim())||form.method.some(s=>s.trim()));
   const set=(k,v)=>setForm(f=>Object.assign({},f,{[k]:v}));
   const setIng=(i,k,v)=>setForm(f=>{const a=[...f.ingredients];a[i]=Object.assign({},a[i],{[k]:v});return Object.assign({},f,{ingredients:a});});
@@ -383,27 +338,6 @@ function RecipeForm({initial,categories,onSave,onCancel}){
   function handleCancel(){
     if(isDirty&&!window.confirm("Discard changes?"))return;
     onCancel();
-  }
-
-  async function handleDocxUpload(file){
-    if(!file)return;
-    if(!file.name.toLowerCase().endsWith(".docx")){setParseErr("Please upload a .docx file.");return;}
-    if(file.size>10*1024*1024){setParseErr("File too large — max 10MB.");return;}
-    if(isDirty&&!window.confirm("This will replace the current form. Continue?"))return;
-    setParsing(true);setParseErr("");setParsed(false);
-    try{
-      const arrayBuffer=await file.arrayBuffer();
-      const result=await mammoth.extractRawText({arrayBuffer});
-      const text=result.value;
-      if(!text.trim())throw new Error("No readable text found in document.");
-      const raw=await parseRecipeFromText(text);
-      setForm(validateParsed(raw));
-      setParsed(true);
-    }catch(e){
-      setParseErr(e.message||"Could not parse document. Fill in manually below.");
-    }
-    setParsing(false);
-    if(fileRef.current)fileRef.current.value="";
   }
 
   async function handleSave(){
@@ -421,34 +355,6 @@ function RecipeForm({initial,categories,onSave,onCancel}){
 
   return (
     <div>
-      {!initial&&(
-        <div>
-          <div
-            style={Object.assign({},st.uploadBox,
-              parsing?{opacity:.6,cursor:"wait"}:
-              parsed?{borderColor:"rgba(90,180,70,0.6)",background:"rgba(10,30,8,0.4)"}:{})}
-            onClick={()=>!parsing&&fileRef.current&&fileRef.current.click()}
-            onDragOver={e=>e.preventDefault()}
-            onDrop={e=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)handleDocxUpload(f);}}>
-            <input ref={fileRef} type="file" accept=".docx" style={{display:"none"}}
-              onChange={e=>e.target.files[0]&&handleDocxUpload(e.target.files[0])}/>
-            <p style={{fontSize:"1.4rem",marginBottom:".4rem"}}>{parsing?"⏳":parsed?"✅":"📄"}</p>
-            <p style={{fontSize:".875rem",fontWeight:"600",color:parsed?C.green:C.tBody,marginBottom:".2rem"}}>
-              {parsing?"Reading document…":parsed?"Recipe imported — review and save below":"Upload a Word doc to auto-fill"}
-            </p>
-            <p style={{fontSize:".75rem",color:C.tSub}}>
-              {parsing?"Parsing with AI — a few seconds…":"Drag & drop or tap · .docx only · max 10MB"}
-            </p>
-          </div>
-          {parseErr&&(
-            <div style={Object.assign({},st.errBox,{marginBottom:".875rem"})}>
-              <p style={{fontSize:".8rem",color:"#ffd0c0"}}>⚠ {parseErr}</p>
-              <p style={{fontSize:".75rem",color:C.tSub,marginTop:".3rem"}}>Fill in the recipe manually below.</p>
-            </div>
-          )}
-          {parsed&&<div style={{height:"1px",background:C.divider,marginBottom:"1.25rem"}}/>}
-        </div>
-      )}
       <div style={{marginBottom:"1rem"}}>
         <label style={st.lbl}>Recipe Name *</label>
         <input style={Object.assign({},st.input,err&&!form.name.trim()?{borderColor:C.rust}:{})}
@@ -494,8 +400,8 @@ function RecipeForm({initial,categories,onSave,onCancel}){
       </div>
       {err&&<div style={Object.assign({},st.errBox,{marginBottom:".875rem"})}><p style={{fontSize:".8rem",color:"#ffd0c0"}}>⚠ {err}</p></div>}
       <div style={{display:"flex",gap:".75rem",flexWrap:"wrap",paddingTop:".25rem"}}>
-        <button style={Object.assign({},st.btnP,{opacity:saving||parsing?0.5:1})}
-          onClick={handleSave} disabled={saving||parsing}>{saving?"Saving…":"Save Recipe"}</button>
+        <button style={Object.assign({},st.btnP,{opacity:saving?0.5:1})}
+          onClick={handleSave} disabled={saving}>{saving?"Saving…":"Save Recipe"}</button>
         <button style={st.btnGhost} onClick={handleCancel} disabled={saving}>Cancel</button>
       </div>
     </div>
