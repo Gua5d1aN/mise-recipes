@@ -107,7 +107,7 @@ async function sendMagicLink(email){
   const redirectTo = window.location.href.split("#")[0]; // current page without hash
   const r = await fetch(MAGIC_LINK_FN,{
     method:"POST",
-    headers:{"Content-Type":"application/json","apikey":SB_KEY},
+    headers:{"Content-Type":"application/json","apikey":SB_KEY,"Authorization":"Bearer "+SB_KEY},
     body:JSON.stringify({email,redirectTo})
   });
   if(!r.ok) throw new Error("Could not send link. Try again.");
