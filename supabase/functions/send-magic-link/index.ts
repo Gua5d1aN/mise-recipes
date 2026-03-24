@@ -1,9 +1,10 @@
+// send-magic-link — Mise Recipes edge function
+// Created by Joshua Bosen — All rights reserved.
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const ALLOWED_ORIGINS = [
   "https://gua5d1an.github.io",
-  // Add additional property domains here as you deploy them
 ];
 
 function corsHeaders(req: Request) {
@@ -16,85 +17,68 @@ function corsHeaders(req: Request) {
   };
 }
 
-// Always returns { success: true } regardless of outcome — never reveal
-// whether an email is on the allowlist (prevents enumeration)
-function ok(cors: Record<string, string>) {
-  return new Response(JSON.stringify({ success: true }), {
-    headers: { ...cors, "Content-Type": "application/json" },
-  });
-}
-
 serve(async (req) => {
   const CORS = corsHeaders(req);
 
-  if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
-  if (req.method !== "POST") {
-    return new Response(JSON.stringify({ error: "Method not allowed" }), {
-      status: 405, headers: { ...CORS, "Content-Type": "application/json" },
-    });
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: CORS });
   }
 
   try {
     const { email, redirectTo } = await req.json();
 
     if (!email || typeof email !== "string" || !email.includes("@")) {
-      return ok(CORS); // Don't reveal validation errors
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { ...CORS, "Content-Type": "application/json" },
+      });
     }
 
     const cleanEmail = email.trim().toLowerCase();
 
-    // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are injected automatically
-    // into all Supabase edge functions — no manual secrets needed for these
+    // Admin client — uses service role key, injected automatically by Supabase
     const adminClient = createClient(
       Deno.env.get("SUPABASE_URL")!,
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
       { auth: { autoRefreshToken: false, persistSession: false } }
     );
 
-    // Check allowlist — uses service role, result never sent to client
-    const { data: allowed } = await adminClient
+    // Check allowlist server-side only — result never sent to client
+    const { data: allowedUser } = await adminClient
       .from("allowed_emails")
       .select("email, role")
       .eq("email", cleanEmail)
       .single();
 
-    if (allowed) {
-      // Valid email — send magic link via Supabase OTP
-      // Using the auth API directly so Supabase handles email delivery
+    if (allowedUser) {
       const safeRedirect = (
         typeof redirectTo === "string" &&
         ALLOWED_ORIGINS.some(o => redirectTo.startsWith(o))
       ) ? redirectTo : ALLOWED_ORIGINS[0];
 
-      await adminClient.auth.admin.generateLink({
-        type: "magiclink",
+      // signInWithOtp actually sends the magic link email
+      const { error } = await adminClient.auth.signInWithOtp({
         email: cleanEmail,
-        options: { redirectTo: safeRedirect },
+        options: {
+          emailRedirectTo: safeRedirect,
+          shouldCreateUser: true,
+        },
       });
 
-      // generateLink creates the user if needed and returns the link,
-      // but doesn't send the email. Use signInWithOtp to trigger delivery.
-      await fetch(`${Deno.env.get("SUPABASE_URL")}/auth/v1/otp`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "apikey": Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-          "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,
-        },
-        body: JSON.stringify({
-          email: cleanEmail,
-          create_user: true,
-          data: { role: allowed.role },
-          options: { redirectTo: safeRedirect },
-        }),
-      });
+      if (error) {
+        console.error("signInWithOtp error:", error.message);
+      }
     }
 
-    // Always return success — don't reveal if email was found or not
-    return ok(CORS);
+    // Always return success — never reveal if email was on allowlist
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { ...CORS, "Content-Type": "application/json" },
+    });
 
   } catch (err) {
     console.error("send-magic-link error:", err);
-    return ok(CORS); // Still return success to prevent enumeration
+    return new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { ...CORS, "Content-Type": "application/json" },
+    });
   }
 });
