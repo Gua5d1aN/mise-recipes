@@ -4,6 +4,7 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="mobile-web-app-capable" content="yes"/>
 <meta name="theme-color" content="#0e1f0e"/>
 <meta name="description" content="Mise Recipes — Kitchen recipe database"/>
 <title>Mise Recipes</title>
@@ -15,7 +16,7 @@
 <style>
 /*
   Mise Recipes
-  Created by Josh — All rights reserved.
+  Created by Joshua Bosen — All rights reserved.
 */
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html{scroll-behavior:smooth}
@@ -43,7 +44,7 @@ select option{background:#162016;color:#f0ede8}
 <script type="text/babel">
 /*
   Mise Recipes — Standalone kitchen recipe database
-  Created by Josh / All rights reserved.
+  Created by Joshua Bosen — All rights reserved.
 */
 const { useState, useEffect, useCallback, useRef } = React;
 
@@ -66,7 +67,10 @@ const sbClient = window.supabase.createClient(SB_URL, SB_KEY, {
 let _session = null;
 
 function authHdrs() {
-  const token = _session?.access_token || SB_KEY;
+  // Always use the user's session token for DB calls — never fall back to anon key
+  // RLS policies require an authenticated session; unauthenticated calls will be rejected
+  const token = _session?.access_token;
+  if(!token) throw new Error("Not authenticated.");
   return { "Content-Type":"application/json","apikey":SB_KEY,"Authorization":"Bearer "+token };
 }
 
@@ -679,7 +683,8 @@ function App(){
 
   async function handleLogin(){
     const email=loginEmail.trim().toLowerCase();
-    if(!email||!email.includes("@")){setLoginErr("Enter a valid email address.");return;}
+    const emailRegex=/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+    if(!email||!emailRegex.test(email)){setLoginErr("Enter a valid email address.");return;}
     setLoginLoading(true);setLoginErr("");
     try{await sendMagicLink(email);setLoginSent(true);}
     catch(e){setLoginErr("Could not send link. Check your connection and try again.");}
@@ -721,6 +726,7 @@ function App(){
 
   // ── CRUD ────────────────────────────────────────────────────────────────────
   async function handleSave(form){
+    if(!isAdmin){showToast("Not authorised.");return;}
     const payload=Object.assign({},form,{property:PROPERTY});
     if(editTarget){
       const [updated]=await dbPatch("recipes",editTarget.id,payload);
@@ -735,6 +741,7 @@ function App(){
     setShowForm(false);setEdit(null);
   }
   async function handleDelete(recipe){
+    if(!isAdmin){showToast("Not authorised.");return;}
     await dbDelete("recipes",recipe.id);
     setRecipes(prev=>prev.filter(r=>r.id!==recipe.id));
     setSelected(null);setView("list");
@@ -766,6 +773,8 @@ function App(){
               placeholder="you@example.com"
               value={loginEmail}
               autoFocus
+              autoComplete="off"
+              spellCheck="false"
               onChange={e=>{setLoginEmail(e.target.value);setLoginErr("");}}
               onKeyDown={e=>{if(e.key==="Enter")handleLogin();}}
             />
