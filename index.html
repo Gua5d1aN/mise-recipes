@@ -59,8 +59,32 @@ const MAGIC_LINK_FN = SB_URL + "/functions/v1/send-magic-link";
 
 // ── Supabase client — handles auth, token refresh, session persistence ────────
 const sbClient = window.supabase.createClient(SB_URL, SB_KEY, {
-  auth: { persistSession: true, autoRefreshToken: true },
+  auth: { persistSession: true, autoRefreshToken: false },
 });
+
+// ── Session expiry — force re-login after 60 minutes ─────────────────────────
+const SESSION_DURATION_MS = 60 * 60 * 1000; // 60 minutes
+const SESSION_START_KEY   = "mise_session_start";
+let _sessionTimer = null;
+
+function clearSessionTimer(){
+  if(_sessionTimer){ clearTimeout(_sessionTimer); _sessionTimer=null; }
+}
+function startSessionTimer(signOutFn){
+  clearSessionTimer();
+  const now      = Date.now();
+  const stored   = parseInt(sessionStorage.getItem(SESSION_START_KEY)||"0",10);
+  const start    = stored && stored > now - SESSION_DURATION_MS ? stored : now;
+  const elapsed  = now - start;
+  const remaining = SESSION_DURATION_MS - elapsed;
+  sessionStorage.setItem(SESSION_START_KEY, String(start));
+  if(remaining <= 0){
+    // Already expired — sign out immediately on next tick
+    setTimeout(signOutFn, 0);
+  } else {
+    _sessionTimer = setTimeout(signOutFn, remaining);
+  }
+}
 
 // Module-level session — kept in sync via onAuthStateChange
 // Used to inject the user's token into raw fetch calls so RLS works
@@ -75,9 +99,12 @@ function authHdrs() {
 }
 
 // ── Supabase DB helpers ───────────────────────────────────────────────────────
+async function sbErrMsg(r, fallback){
+  try{ const b=await r.json(); return b.message||b.hint||b.error||fallback; }catch(_){ return fallback; }
+}
 async function dbFetch(path){
   const r = await fetch(SB_URL+"/rest/v1/"+path,{headers:authHdrs()});
-  if(!r.ok) throw new Error("Failed to load.");
+  if(!r.ok){ const m=await sbErrMsg(r,"Failed to load."); throw new Error(m+" ("+r.status+")"); }
   return r.json();
 }
 async function dbPost(table,body){
@@ -86,7 +113,7 @@ async function dbPost(table,body){
     headers:Object.assign({},authHdrs(),{"Prefer":"return=representation"}),
     body:JSON.stringify(body)
   });
-  if(!r.ok) throw new Error("Save failed. Check connection.");
+  if(!r.ok){ const m=await sbErrMsg(r,"Save failed."); throw new Error(m+" ("+r.status+")"); }
   return r.json();
 }
 async function dbPatch(table,id,body){
@@ -95,12 +122,12 @@ async function dbPatch(table,id,body){
     headers:Object.assign({},authHdrs(),{"Prefer":"return=representation"}),
     body:JSON.stringify(body)
   });
-  if(!r.ok) throw new Error("Update failed. Check connection.");
+  if(!r.ok){ const m=await sbErrMsg(r,"Update failed."); throw new Error(m+" ("+r.status+")"); }
   return r.json();
 }
 async function dbDelete(table,id){
   const r = await fetch(SB_URL+"/rest/v1/"+table+"?id=eq."+id,{method:"DELETE",headers:authHdrs()});
-  if(!r.ok) throw new Error("Delete failed. Check connection.");
+  if(!r.ok){ const m=await sbErrMsg(r,"Delete failed."); throw new Error(m+" ("+r.status+")"); }
 }
 function fetchRecipes(){
   return dbFetch("recipes?property=eq."+encodeURIComponent(PROPERTY)+"&order=category.asc,name.asc&select=*");
@@ -652,11 +679,21 @@ function App(){
 
   // ── Auth init ───────────────────────────────────────────────────────────────
   useEffect(()=>{
+    const doSignOut = async () => {
+      clearSessionTimer();
+      sessionStorage.removeItem(SESSION_START_KEY);
+      await sbClient.auth.signOut();
+    };
+
     // Check initial session (handles magic link callback via URL hash automatically)
     sbClient.auth.getSession().then(({data:{session}})=>{
       _session=session;
       setSession(session);
-      if(session){setUserEmail(session.user.email);fetchRole();}
+      if(session){
+        setUserEmail(session.user.email);
+        fetchRole();
+        startSessionTimer(doSignOut); // enforce 60-min limit on page load
+      }
       else setAuthLoading(false);
     });
 
@@ -664,11 +701,23 @@ function App(){
     const {data:{subscription}}=sbClient.auth.onAuthStateChange((event,session)=>{
       _session=session;
       setSession(session);
-      if(session){setUserEmail(session.user.email);fetchRole();}
-      else{setUserRole(null);setUserEmail(null);setAuthLoading(false);}
+      if(session){
+        setUserEmail(session.user.email);
+        fetchRole();
+        if(event==="SIGNED_IN"){
+          // Fresh login — reset the 60-min clock
+          sessionStorage.setItem(SESSION_START_KEY, String(Date.now()));
+          startSessionTimer(doSignOut);
+        }
+      }
+      else{
+        clearSessionTimer();
+        sessionStorage.removeItem(SESSION_START_KEY);
+        setUserRole(null);setUserEmail(null);setAuthLoading(false);
+      }
     });
 
-    return ()=>subscription.unsubscribe();
+    return ()=>{ subscription.unsubscribe(); clearSessionTimer(); };
   },[]);
 
   async function fetchRole(){
