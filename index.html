@@ -776,7 +776,9 @@ function App(){
   // ── CRUD ────────────────────────────────────────────────────────────────────
   async function handleSave(form){
     if(!isAdmin){showToast("Not authorised.");return;}
-    const payload=Object.assign({},form,{property:PROPERTY});
+    // Strip read-only/auto fields — Postgres won't allow updating id or timestamps
+    const {id:_id, created_at:_ca, updated_at:_ua, ...formFields} = form;
+    const payload=Object.assign({},formFields,{property:PROPERTY});
     if(editTarget){
       const [updated]=await dbPatch("recipes",editTarget.id,payload);
       setRecipes(prev=>prev.map(r=>r.id===editTarget.id?updated:r));
