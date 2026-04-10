@@ -953,6 +953,21 @@ function App(){
         <RecipeDetail recipe={selected} isAdmin={isAdmin}
           onBack={()=>setView("list")} onEdit={openEdit} onDelete={handleDelete}/>
       </div>
+      {showForm&&(
+        <div style={st.overlay}>
+          <div style={st.modal}>
+            <h2 style={{fontSize:"1.2rem",fontWeight:"700",color:C.tPrimary,marginBottom:"1.5rem"}}>
+              Edit Recipe
+            </h2>
+            <RecipeForm
+              initial={editTarget}
+              categories={categories.filter(c=>c!=="All")}
+              onSave={handleSave}
+              onCancel={()=>{setShowForm(false);setEdit(null);}}
+            />
+          </div>
+        </div>
+      )}
       <Toast msg={toast}/>
     </div>
   );
