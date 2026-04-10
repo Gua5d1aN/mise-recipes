@@ -843,6 +843,7 @@ function App(){
       showToast("Recipe saved ✓");
     }
     setShowForm(false);setEdit(null);
+    if(editTarget) setView("detail"); // Return to detail view so user can see the update
   }
   async function handleDelete(recipe){
     if(!isAdmin){showToast("Not authorised.");return;}
@@ -851,7 +852,7 @@ function App(){
     setSelected(null);setView("list");
     showToast("Recipe deleted");
   }
-  function openEdit(r){setEdit(r);setShowForm(true);setView("list");}
+  function openEdit(r){setEdit(r);setShowForm(true);} // Don't change view — form overlays current page
 
   // ── Batch select helpers ──────────────────────────────────────────────────
   function toggleBatchSelect(id){
