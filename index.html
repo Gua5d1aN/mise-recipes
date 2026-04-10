@@ -59,32 +59,8 @@ const MAGIC_LINK_FN = SB_URL + "/functions/v1/send-magic-link";
 
 // ── Supabase client — handles auth, token refresh, session persistence ────────
 const sbClient = window.supabase.createClient(SB_URL, SB_KEY, {
-  auth: { persistSession: true, autoRefreshToken: false },
+  auth: { persistSession: true, autoRefreshToken: true },
 });
-
-// ── Session expiry — force re-login after 60 minutes ─────────────────────────
-const SESSION_DURATION_MS = 60 * 60 * 1000; // 60 minutes
-const SESSION_START_KEY   = "mise_session_start";
-let _sessionTimer = null;
-
-function clearSessionTimer(){
-  if(_sessionTimer){ clearTimeout(_sessionTimer); _sessionTimer=null; }
-}
-function startSessionTimer(signOutFn){
-  clearSessionTimer();
-  const now      = Date.now();
-  const stored   = parseInt(sessionStorage.getItem(SESSION_START_KEY)||"0",10);
-  const start    = stored && stored > now - SESSION_DURATION_MS ? stored : now;
-  const elapsed  = now - start;
-  const remaining = SESSION_DURATION_MS - elapsed;
-  sessionStorage.setItem(SESSION_START_KEY, String(start));
-  if(remaining <= 0){
-    // Already expired — sign out immediately on next tick
-    setTimeout(signOutFn, 0);
-  } else {
-    _sessionTimer = setTimeout(signOutFn, remaining);
-  }
-}
 
 // Module-level session — kept in sync via onAuthStateChange
 // Used to inject the user's token into raw fetch calls so RLS works
@@ -99,12 +75,9 @@ function authHdrs() {
 }
 
 // ── Supabase DB helpers ───────────────────────────────────────────────────────
-async function sbErrMsg(r, fallback){
-  try{ const b=await r.json(); return b.message||b.hint||b.error||fallback; }catch(_){ return fallback; }
-}
 async function dbFetch(path){
   const r = await fetch(SB_URL+"/rest/v1/"+path,{headers:authHdrs()});
-  if(!r.ok){ const m=await sbErrMsg(r,"Failed to load."); throw new Error(m+" ("+r.status+")"); }
+  if(!r.ok) throw new Error("Failed to load.");
   return r.json();
 }
 async function dbPost(table,body){
@@ -113,7 +86,7 @@ async function dbPost(table,body){
     headers:Object.assign({},authHdrs(),{"Prefer":"return=representation"}),
     body:JSON.stringify(body)
   });
-  if(!r.ok){ const m=await sbErrMsg(r,"Save failed."); throw new Error(m+" ("+r.status+")"); }
+  if(!r.ok) throw new Error("Save failed. Check connection.");
   return r.json();
 }
 async function dbPatch(table,id,body){
@@ -122,12 +95,22 @@ async function dbPatch(table,id,body){
     headers:Object.assign({},authHdrs(),{"Prefer":"return=representation"}),
     body:JSON.stringify(body)
   });
-  if(!r.ok){ const m=await sbErrMsg(r,"Update failed."); throw new Error(m+" ("+r.status+")"); }
+  if(!r.ok) throw new Error("Update failed. Check connection.");
   return r.json();
 }
 async function dbDelete(table,id){
   const r = await fetch(SB_URL+"/rest/v1/"+table+"?id=eq."+id,{method:"DELETE",headers:authHdrs()});
-  if(!r.ok){ const m=await sbErrMsg(r,"Delete failed."); throw new Error(m+" ("+r.status+")"); }
+  if(!r.ok) throw new Error("Delete failed. Check connection.");
+}
+async function dbPatchMany(table,ids,body){
+  // Batch update multiple rows by ID array in a single API call
+  if(!ids||ids.length===0) return;
+  const r = await fetch(SB_URL+"/rest/v1/"+table+"?id=in.("+ids.join(",")+")",{
+    method:"PATCH",
+    headers:Object.assign({},authHdrs(),{"Prefer":"return=minimal"}),
+    body:JSON.stringify(body)
+  });
+  if(!r.ok) throw new Error("Batch update failed. Check connection.");
 }
 function fetchRecipes(){
   return dbFetch("recipes?property=eq."+encodeURIComponent(PROPERTY)+"&order=category.asc,name.asc&select=*");
@@ -645,6 +628,82 @@ function UserManagement({onClose}){
   );
 }
 
+// ── Category manager (admin only) ─────────────────────────────────────────────
+// Deleting a category moves all its recipes to "Base". "Base" is protected.
+function CategoryManager({categories,recipes,onUpdated,onClose}){
+  const [confirming,setConfirming] = useState(null); // category name being confirmed
+  const [working,setWorking]       = useState(false);
+  const [err,setErr]               = useState("");
+
+  // Real categories only (not "All", not "Base")
+  const deletable = categories.filter(c=>c!=="All"&&c!=="Base").sort();
+
+  async function handleDelete(cat){
+    setWorking(true);setErr("");
+    try{
+      const affected = recipes.filter(r=>r.category===cat&&!r._isDemo).map(r=>r.id);
+      if(affected.length>0){
+        await dbPatchMany("recipes",affected,{category:"Base"});
+      }
+      onUpdated(cat,affected);
+      setConfirming(null);
+    }catch(e){
+      setErr(e.message||"Failed. Check connection.");
+    }
+    setWorking(false);
+  }
+
+  return (
+    <div style={st.overlay} onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={st.modal}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"1.5rem"}}>
+          <h2 style={{fontSize:"1.1rem",fontWeight:"700",color:C.tPrimary}}>Manage Categories</h2>
+          <button style={st.btnGhost} onClick={onClose}>Close</button>
+        </div>
+        <p style={{fontSize:".78rem",color:C.tSub,marginBottom:"1.25rem",lineHeight:"1.5"}}>
+          Deleting a category moves all its recipes to <strong style={{color:C.tBody}}>Base</strong>. This cannot be undone.
+          The <strong style={{color:C.tBody}}>Base</strong> category is protected and cannot be deleted.
+        </p>
+        {err&&<div style={Object.assign({},st.errBox,{marginBottom:"1rem"})}><p style={{fontSize:".8rem",color:"#ffd0c0"}}>⚠ {err}</p></div>}
+        {deletable.length===0&&(
+          <p style={{fontSize:".85rem",color:C.tSub,textAlign:"center",padding:"1.5rem 0"}}>No categories to manage.</p>
+        )}
+        {deletable.map(cat=>{
+          const count=recipes.filter(r=>r.category===cat&&!r._isDemo).length;
+          const isConfirming=confirming===cat;
+          return(
+            <div key={cat} style={{background:C.card,border:"1px solid "+(isConfirming?"#7a3820":C.cardBorder),borderRadius:".875rem",padding:"1rem",marginBottom:".625rem",transition:"border-color .2s"}}>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:"1rem"}}>
+                <div>
+                  <p style={{fontSize:".9rem",fontWeight:"600",color:C.tPrimary}}>{cat}</p>
+                  <p style={{fontSize:".72rem",color:C.tSub,marginTop:".15rem"}}>{count} recipe{count!==1?"s":""}</p>
+                </div>
+                {!isConfirming&&(
+                  <button style={st.btnDanger} onClick={()=>{setConfirming(cat);setErr("");}}>Delete</button>
+                )}
+              </div>
+              {isConfirming&&(
+                <div style={{marginTop:".875rem",paddingTop:".875rem",borderTop:"1px solid rgba(122,56,32,0.4)"}}>
+                  <p style={{fontSize:".8rem",color:"#ffd0c0",marginBottom:".75rem"}}>
+                    Delete <strong>"{cat}"</strong>? {count>0?`${count} recipe${count!==1?"s":""} will move to Base.`:"No recipes will be affected."}
+                  </p>
+                  <div style={{display:"flex",gap:".5rem"}}>
+                    <button style={Object.assign({},st.btnDangerSolid,{opacity:working?0.5:1})}
+                      onClick={()=>handleDelete(cat)} disabled={working}>
+                      {working?"Moving…":"Yes, delete category"}
+                    </button>
+                    <button style={st.btnGhost} onClick={()=>setConfirming(null)} disabled={working}>Cancel</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 function App(){
   // Auth state
@@ -670,8 +729,15 @@ function App(){
   const [selected,setSelected]   = useState(null);
   const [showForm,setShowForm]   = useState(false);
   const [editTarget,setEdit]     = useState(null);
-  const [showUsers,setShowUsers] = useState(false);
-  const [toast,setToast]         = useState("");
+  const [showUsers,setShowUsers]   = useState(false);
+  const [showCatMgr,setShowCatMgr] = useState(false);
+  const [toast,setToast]           = useState("");
+
+  // Batch select state
+  const [batchMode,setBatchMode]     = useState(false);
+  const [batchSelected,setBatchSelected] = useState([]); // array of recipe IDs
+  const [batchCat,setBatchCat]       = useState("");
+  const [batchWorking,setBatchWorking] = useState(false);
 
   const isAdmin = userRole==="admin";
 
@@ -679,21 +745,11 @@ function App(){
 
   // ── Auth init ───────────────────────────────────────────────────────────────
   useEffect(()=>{
-    const doSignOut = async () => {
-      clearSessionTimer();
-      sessionStorage.removeItem(SESSION_START_KEY);
-      await sbClient.auth.signOut();
-    };
-
     // Check initial session (handles magic link callback via URL hash automatically)
     sbClient.auth.getSession().then(({data:{session}})=>{
       _session=session;
       setSession(session);
-      if(session){
-        setUserEmail(session.user.email);
-        fetchRole();
-        startSessionTimer(doSignOut); // enforce 60-min limit on page load
-      }
+      if(session){setUserEmail(session.user.email);fetchRole();}
       else setAuthLoading(false);
     });
 
@@ -701,23 +757,11 @@ function App(){
     const {data:{subscription}}=sbClient.auth.onAuthStateChange((event,session)=>{
       _session=session;
       setSession(session);
-      if(session){
-        setUserEmail(session.user.email);
-        fetchRole();
-        if(event==="SIGNED_IN"){
-          // Fresh login — reset the 60-min clock
-          sessionStorage.setItem(SESSION_START_KEY, String(Date.now()));
-          startSessionTimer(doSignOut);
-        }
-      }
-      else{
-        clearSessionTimer();
-        sessionStorage.removeItem(SESSION_START_KEY);
-        setUserRole(null);setUserEmail(null);setAuthLoading(false);
-      }
+      if(session){setUserEmail(session.user.email);fetchRole();}
+      else{setUserRole(null);setUserEmail(null);setAuthLoading(false);}
     });
 
-    return ()=>{ subscription.unsubscribe(); clearSessionTimer(); };
+    return ()=>subscription.unsubscribe();
   },[]);
 
   async function fetchRole(){
@@ -776,9 +820,7 @@ function App(){
   // ── CRUD ────────────────────────────────────────────────────────────────────
   async function handleSave(form){
     if(!isAdmin){showToast("Not authorised.");return;}
-    // Strip read-only/auto fields — Postgres won't allow updating id or timestamps
-    const {id:_id, created_at:_ca, updated_at:_ua, ...formFields} = form;
-    const payload=Object.assign({},formFields,{property:PROPERTY});
+    const payload=Object.assign({},form,{property:PROPERTY});
     if(editTarget){
       const [updated]=await dbPatch("recipes",editTarget.id,payload);
       setRecipes(prev=>prev.map(r=>r.id===editTarget.id?updated:r));
@@ -799,6 +841,36 @@ function App(){
     showToast("Recipe deleted");
   }
   function openEdit(r){setEdit(r);setShowForm(true);setView("list");}
+
+  // ── Batch select helpers ──────────────────────────────────────────────────
+  function toggleBatchSelect(id){
+    setBatchSelected(prev=>prev.includes(id)?prev.filter(x=>x!==id):[...prev,id]);
+  }
+  function toggleSelectAll(){
+    const visibleIds=filtered.filter(r=>!r._isDemo).map(r=>r.id);
+    setBatchSelected(prev=>prev.length===visibleIds.length?[]:visibleIds);
+  }
+  function exitBatchMode(){setBatchMode(false);setBatchSelected([]);setBatchCat("");}
+
+  async function handleBatchCategory(){
+    if(!batchCat||!batchSelected.length) return;
+    if(!isAdmin){showToast("Not authorised.");return;}
+    setBatchWorking(true);
+    try{
+      await dbPatchMany("recipes",batchSelected,{category:batchCat});
+      setRecipes(prev=>prev.map(r=>batchSelected.includes(r.id)?Object.assign({},r,{category:batchCat}):r));
+      showToast(`${batchSelected.length} recipe${batchSelected.length!==1?"s":""} moved to ${batchCat} ✓`);
+      exitBatchMode();
+    }catch(e){showToast("Batch update failed — check connection.");}
+    setBatchWorking(false);
+  }
+
+  // ── Category delete handler ───────────────────────────────────────────────
+  function handleCategoryDeleted(deletedCat,affectedIds){
+    setRecipes(prev=>prev.map(r=>affectedIds.includes(r.id)?Object.assign({},r,{category:"Base"}):r));
+    if(filterCat===deletedCat) setFilter("All");
+    showToast(`"${deletedCat}" deleted — ${affectedIds.length} recipe${affectedIds.length!==1?"s":""} moved to Base`);
+  }
 
   // ── Render: loading ─────────────────────────────────────────────────────────
   if(authLoading) return (
@@ -887,6 +959,7 @@ function App(){
           <div style={{display:"flex",gap:".5rem",alignItems:"center",flexWrap:"wrap"}}>
             {isAdmin&&<>
               <button style={st.btnP} onClick={()=>{setEdit(null);setShowForm(true);}}>+ New Recipe</button>
+              <button style={st.btnGhost} onClick={()=>setShowCatMgr(true)}>Categories</button>
               <button style={st.btnGhost} onClick={()=>setShowUsers(true)}>Manage Access</button>
             </>}
             <button style={st.btnGhost} onClick={handleSignOut} title={"Signed in as "+userEmail}>
@@ -912,13 +985,47 @@ function App(){
             onChange={e=>setSearch(e.target.value)}/>
         </div>
 
-        {/* Category filters */}
+        {/* Category filters + Select toggle */}
         {categories.length>1&&(
-          <div style={st.filterRow} className="no-print">
-            {categories.map(c=>(
-              <button key={c} style={Object.assign({},st.chip,filterCat===c?st.chipOn:{})}
-                onClick={()=>setFilter(c)}>{c}</button>
-            ))}
+          <div style={Object.assign({},st.filterRow,{alignItems:"center"})} className="no-print">
+            <div style={{display:"flex",gap:".5rem",flexWrap:"wrap",flex:"1"}}>
+              {categories.map(c=>(
+                <button key={c} style={Object.assign({},st.chip,filterCat===c?st.chipOn:{})}
+                  onClick={()=>setFilter(c)}>{c}</button>
+              ))}
+            </div>
+            {isAdmin&&!batchMode&&(
+              <button style={Object.assign({},st.btnGhost,{flexShrink:"0"})}
+                onClick={()=>{setBatchMode(true);setBatchSelected([]);setBatchCat("");}}>Select</button>
+            )}
+          </div>
+        )}
+
+        {/* Batch action bar */}
+        {isAdmin&&batchMode&&(
+          <div style={{background:"rgba(10,20,8,0.7)",border:"1px solid "+C.cardBorder,borderRadius:"1rem",padding:".875rem 1rem",marginBottom:"1.25rem",display:"flex",gap:".75rem",flexWrap:"wrap",alignItems:"center"}} className="no-print">
+            <button style={Object.assign({},st.chip,{flexShrink:"0"})} onClick={toggleSelectAll}>
+              {batchSelected.length===filtered.filter(r=>!r._isDemo).length&&filtered.filter(r=>!r._isDemo).length>0?"Deselect all":"Select all"}
+            </button>
+            <span style={{fontSize:".8rem",color:C.tSub,flexShrink:"0"}}>
+              {batchSelected.length} selected
+            </span>
+            <div style={{display:"flex",gap:".5rem",flex:"1",flexWrap:"wrap",alignItems:"center"}}>
+              <select
+                style={{background:C.field,border:"1px solid "+C.fieldBorder,borderRadius:".625rem",padding:".5rem .75rem",color:batchCat?C.tBody:C.tSub,fontSize:".8rem",outline:"none",flex:"1",minWidth:"120px"}}
+                value={batchCat}
+                onChange={e=>setBatchCat(e.target.value)}>
+                <option value="">Move to category…</option>
+                {categories.filter(c=>c!=="All").map(c=><option key={c} value={c}>{c}</option>)}
+              </select>
+              <button
+                style={Object.assign({},st.btnP,{padding:".5rem 1rem",fontSize:".8rem",opacity:(batchSelected.length===0||!batchCat||batchWorking)?0.4:1})}
+                disabled={batchSelected.length===0||!batchCat||batchWorking}
+                onClick={handleBatchCategory}>
+                {batchWorking?"Saving…":"Apply"}
+              </button>
+            </div>
+            <button style={st.btnGhost} onClick={exitBatchMode}>Cancel</button>
           </div>
         )}
 
@@ -945,26 +1052,41 @@ function App(){
         {!dataLoading&&sortedCats.map(cat=>(
           <div key={cat} style={{marginBottom:showLabels?"1.75rem":0}}>
             {showLabels&&<p style={st.catLbl}>{cat}</p>}
-            {(grouped[cat]||[]).map(r=>(
-              <button key={r.id} style={st.recipeCard}
-                onClick={()=>{setSelected(r);setView("detail");}}
-                onMouseEnter={e=>e.currentTarget.style.background=C.cardHov}
-                onMouseLeave={e=>e.currentTarget.style.background=C.card}>
-                <div style={{flex:"1",textAlign:"left",minWidth:"0"}}>
-                  <p style={st.rName}>
-                    {r.name}
-                    {r._isDemo&&<span style={{fontSize:".6rem",letterSpacing:".08em",textTransform:"uppercase",marginLeft:".6rem",padding:".15rem .45rem",borderRadius:".3rem",background:"rgba(212,168,60,0.2)",color:C.amber,verticalAlign:"middle"}}>Demo</span>}
-                  </p>
-                  <p style={st.rMeta}>
-                    {[r.yield_amount&&r.yield_unit?`Yield: ${r.yield_amount} ${r.yield_unit}`:null,
-                      r.ingredients&&r.ingredients.length>0?`${r.ingredients.length} ingredients`:null]
-                      .filter(Boolean).join(" · ")}
-                  </p>
+            {(grouped[cat]||[]).map(r=>{
+              const isChecked=batchSelected.includes(r.id);
+              return(
+                <div key={r.id} style={{position:"relative",display:"flex",alignItems:"center",gap:".75rem",marginBottom:".625rem"}}>
+                  {batchMode&&!r._isDemo&&(
+                    <input type="checkbox" checked={isChecked}
+                      onChange={()=>toggleBatchSelect(r.id)}
+                      style={{width:"1.1rem",height:"1.1rem",accentColor:C.accent,cursor:"pointer",flexShrink:"0"}}/>
+                  )}
+                  <button style={Object.assign({},st.recipeCard,{marginBottom:"0",flex:"1",
+                    borderColor:isChecked&&batchMode?C.accent:C.cardBorder,
+                    background:isChecked&&batchMode?"rgba(212,232,184,0.08)":C.card})}
+                    onClick={()=>{
+                      if(batchMode&&!r._isDemo){toggleBatchSelect(r.id);}
+                      else if(!batchMode){setSelected(r);setView("detail");}
+                    }}
+                    onMouseEnter={e=>{if(!batchMode)e.currentTarget.style.background=C.cardHov;}}
+                    onMouseLeave={e=>{if(!batchMode)e.currentTarget.style.background=isChecked&&batchMode?"rgba(212,232,184,0.08)":C.card;}}>
+                    <div style={{flex:"1",textAlign:"left",minWidth:"0"}}>
+                      <p style={st.rName}>
+                        {r.name}
+                        {r._isDemo&&<span style={{fontSize:".6rem",letterSpacing:".08em",textTransform:"uppercase",marginLeft:".6rem",padding:".15rem .45rem",borderRadius:".3rem",background:"rgba(212,168,60,0.2)",color:C.amber,verticalAlign:"middle"}}>Demo</span>}
+                      </p>
+                      <p style={st.rMeta}>
+                        {[r.yield_amount&&r.yield_unit?`Yield: ${r.yield_amount} ${r.yield_unit}`:null,
+                          r.ingredients&&r.ingredients.length>0?`${r.ingredients.length} ingredients`:null]
+                          .filter(Boolean).join(" · ")}
+                      </p>
+                    </div>
+                    {!showLabels&&r.category&&<span style={st.catBadge}>{r.category}</span>}
+                    {!batchMode&&<span style={{color:C.tSub,fontSize:".9rem",flexShrink:"0",marginLeft:".5rem"}}>›</span>}
+                  </button>
                 </div>
-                {!showLabels&&r.category&&<span style={st.catBadge}>{r.category}</span>}
-                <span style={{color:C.tSub,fontSize:".9rem",flexShrink:"0",marginLeft:".5rem"}}>›</span>
-              </button>
-            ))}
+              );
+            })}
           </div>
         ))}
 
@@ -989,6 +1111,16 @@ function App(){
 
       {/* User management modal */}
       {showUsers&&isAdmin&&<UserManagement onClose={()=>setShowUsers(false)}/>}
+
+      {/* Category manager modal */}
+      {showCatMgr&&isAdmin&&(
+        <CategoryManager
+          categories={categories}
+          recipes={recipes}
+          onUpdated={handleCategoryDeleted}
+          onClose={()=>setShowCatMgr(false)}
+        />
+      )}
 
       <Toast msg={toast}/>
     </div>
