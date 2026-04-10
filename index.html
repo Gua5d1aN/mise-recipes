@@ -735,6 +735,7 @@ function App(){
   const [selected,setSelected]   = useState(null);
   const [showForm,setShowForm]   = useState(false);
   const [editTarget,setEdit]     = useState(null);
+  const editTargetRef            = useRef(null); // ref always holds latest value, avoids stale closure
   const [showUsers,setShowUsers]   = useState(false);
   const [showCatMgr,setShowCatMgr] = useState(false);
   const [toast,setToast]           = useState("");
@@ -826,13 +827,14 @@ function App(){
   // ── CRUD ────────────────────────────────────────────────────────────────────
   async function handleSave(form){
     if(!isAdmin){showToast("Not authorised.");return;}
+    // Use ref — always has the latest editTarget regardless of closure age
+    const target = editTargetRef.current;
     const payload=Object.assign({},form,{property:PROPERTY});
-    if(editTarget){
-      const result=await dbPatch("recipes",editTarget.id,payload);
-      // Supabase returns an array with return=representation
+    if(target){
+      const result=await dbPatch("recipes",target.id,payload);
       const updated=Array.isArray(result)?result[0]:result;
       if(!updated) throw new Error("Update failed — no data returned.");
-      setRecipes(prev=>prev.map(r=>r.id===editTarget.id?updated:r));
+      setRecipes(prev=>prev.map(r=>r.id===target.id?updated:r));
       setSelected(updated);
       showToast("Recipe updated ✓");
     }else{
@@ -842,8 +844,10 @@ function App(){
       setRecipes(prev=>[...prev.filter(r=>!r._isDemo),created]);
       showToast("Recipe saved ✓");
     }
-    setShowForm(false);setEdit(null);
-    if(editTarget) setView("detail"); // Return to detail view so user can see the update
+    editTargetRef.current=null;
+    setShowForm(false);
+    setEdit(null);
+    if(target) setView("detail");
   }
   async function handleDelete(recipe){
     if(!isAdmin){showToast("Not authorised.");return;}
@@ -852,7 +856,11 @@ function App(){
     setSelected(null);setView("list");
     showToast("Recipe deleted");
   }
-  function openEdit(r){setEdit(r);setShowForm(true);} // Don't change view — form overlays current page
+  function openEdit(r){
+    editTargetRef.current=r; // update ref immediately — no stale closure risk
+    setEdit(r);
+    setShowForm(true);
+  }
 
   // ── Batch select helpers ──────────────────────────────────────────────────
   function toggleBatchSelect(id){
@@ -960,10 +968,11 @@ function App(){
               Edit Recipe
             </h2>
             <RecipeForm
+              key={editTarget?.id||'edit-detail'}
               initial={editTarget}
               categories={categories.filter(c=>c!=="All")}
               onSave={handleSave}
-              onCancel={()=>{setShowForm(false);setEdit(null);}}
+              onCancel={()=>{editTargetRef.current=null;setShowForm(false);setEdit(null);}}
             />
           </div>
         </div>
@@ -1127,10 +1136,11 @@ function App(){
               {editTarget?"Edit Recipe":"New Recipe"}
             </h2>
             <RecipeForm
+              key={editTarget?.id||'new-list'}
               initial={editTarget}
               categories={categories.filter(c=>c!=="All")}
               onSave={handleSave}
-              onCancel={()=>{setShowForm(false);setEdit(null);}}
+              onCancel={()=>{editTargetRef.current=null;setShowForm(false);setEdit(null);}}
             />
           </div>
         </div>
