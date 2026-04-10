@@ -137,14 +137,14 @@ async function sendMagicLink(email){
 // ── Sanitise form before save ─────────────────────────────────────────────────
 function sanitise(form){
   return Object.assign({},form,{
-    name        : form.name.trim(),
-    category    : form.category.trim(),
-    yield_amount: form.yield_amount.trim(),
-    yield_unit  : form.yield_unit.trim(),
-    ingredients : form.ingredients
-      .map(i=>({name:i.name.trim(),amount:i.amount.trim(),unit:i.unit.trim()}))
+    name        : (form.name||"").trim(),
+    category    : (form.category||"").trim(),
+    yield_amount: (form.yield_amount||"").trim(),
+    yield_unit  : (form.yield_unit||"").trim(),
+    ingredients : (form.ingredients||[])
+      .map(i=>({name:(i.name||"").trim(),amount:(i.amount||"").trim(),unit:(i.unit||"").trim()}))
       .filter(i=>i.name),
-    method: form.method.map(s=>s.trim()).filter(s=>s),
+    method: (form.method||[]).map(s=>(s||"").trim()).filter(s=>s),
   });
 }
 
@@ -343,7 +343,22 @@ const BLANK={name:"",category:"",yield_amount:"",yield_unit:"portions",
   ingredients:[{name:"",amount:"",unit:""}],method:[""]};
 
 function RecipeForm({initial,categories,onSave,onCancel}){
-  const [form,setForm]     = useState(()=>initial?Object.assign({},BLANK,initial):BLANK);
+  const [form,setForm] = useState(()=>{
+    if(!initial) return BLANK;
+    // Guard against null DB values — seeds often have null yield fields
+    return Object.assign({},BLANK,initial,{
+      name        : initial.name||"",
+      category    : initial.category||"",
+      yield_amount: initial.yield_amount||"",
+      yield_unit  : initial.yield_unit||"portions",
+      ingredients : Array.isArray(initial.ingredients)&&initial.ingredients.length>0
+        ? initial.ingredients.map(i=>({name:i.name||"",amount:i.amount||"",unit:i.unit||""}))
+        : [{name:"",amount:"",unit:""}],
+      method: Array.isArray(initial.method)&&initial.method.length>0
+        ? initial.method.map(s=>s||"")
+        : [""],
+    });
+  });
   const [saving,setSaving] = useState(false);
   const [err,setErr]       = useState("");
   const isDirty=!!(form.name.trim()||form.ingredients.some(i=>i.name.trim())||form.method.some(s=>s.trim()));
