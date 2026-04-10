@@ -90,7 +90,9 @@ async function dbPost(table,body){
   return r.json();
 }
 async function dbPatch(table,id,body){
-  const payload=Object.assign({},body,{updated_at:new Date().toISOString()});
+  // Strip auto-generated columns — Supabase rejects updates to identity columns
+  const {id:_id, created_at:_ca, ...rest} = body;
+  const payload=Object.assign({},rest,{updated_at:new Date().toISOString()});
   const r = await fetch(SB_URL+"/rest/v1/"+table+"?id=eq."+id,{
     method:"PATCH",
     headers:Object.assign({},authHdrs(),{"Prefer":"return=representation"}),
