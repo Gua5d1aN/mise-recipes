@@ -13,6 +13,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js" crossorigin="anonymous"></script>
 <style>
 /*
   Mise Recipes
@@ -57,7 +58,195 @@ const SB_URL  = "https://xfrspqumcsxwxmjqsalg.supabase.co";
 const SB_KEY  = "sb_publishable_3G8P3sjDyfR_7I-ISUiBbA_ahoLxRSq";
 const MAGIC_LINK_FN = SB_URL + "/functions/v1/send-magic-link";
 
-// ── Supabase client — handles auth, token refresh, session persistence ────────
+// ── Excel export ──────────────────────────────────────────────────────────────
+async function exportToXlsx(recipes, filename){
+  const ExcelJS = window.ExcelJS;
+  if(!ExcelJS){ alert("Export library not loaded yet — try again in a moment."); return; }
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Joshua Bosen — Mise Recipes";
+  const ws = wb.addWorksheet("Recipes");
+
+  // Column widths
+  ws.getColumn(1).width = 4;
+  ws.getColumn(2).width = 40;
+  ws.getColumn(3).width = 12;
+  ws.getColumn(4).width = 10;
+
+  // Colour palette
+  const INK  = "FF1A1208";
+  const SAND = "FFF0EDE8";
+  const RULE = "FFE0DBD4";
+  const GOLD = "FFC8A96E";
+  const MID  = "FF8A8078";
+  const ROW0 = "FFFFFFFF";
+  const ROW1 = "FFF7F4F0";
+  const WHITE= "FFFFFFFF";
+
+  function sf(argb){ return {type:"pattern",pattern:"solid",fgColor:{argb}}; }
+  function thinBot(argb){ return {bottom:{style:"thin",color:{argb}}}; }
+
+  let r = 1;
+
+  // ── Sheet header ────────────────────────────────────────────────────────────
+  ws.mergeCells(`A${r}:D${r}`);
+  const hRow = ws.getRow(r);
+  hRow.height = 30;
+  const hCell = hRow.getCell(1);
+  hCell.value = PROPERTY_NAME + " — Mise Recipes";
+  hCell.font  = {name:"Georgia",size:13,bold:true,color:{argb:"FFFFFFFF"}};
+  hCell.fill  = sf(INK);
+  hCell.alignment = {horizontal:"left",vertical:"middle",indent:1};
+  r++;
+
+  ws.mergeCells(`A${r}:D${r}`);
+  const subRow = ws.getRow(r);
+  subRow.height = 16;
+  const subCell = subRow.getCell(1);
+  subCell.value = "Kitchen Reference Export — " + recipes.length + " recipe" + (recipes.length!==1?"s":"");
+  subCell.font  = {name:"Calibri",size:9,italic:true,color:{argb:MID}};
+  subCell.fill  = sf(SAND);
+  subCell.alignment = {horizontal:"left",vertical:"middle",indent:1};
+  r++;
+
+  ws.getRow(r).height = 10; r++;
+
+  // ── Recipes ──────────────────────────────────────────────────────────────────
+  for(const recipe of recipes){
+    if(recipe._isDemo) continue;
+
+    // Name
+    ws.mergeCells(`A${r}:D${r}`);
+    const nameRow = ws.getRow(r);
+    nameRow.height = 28;
+    const nameCell = nameRow.getCell(1);
+    nameCell.value = recipe.name;
+    nameCell.font  = {name:"Georgia",size:15,bold:true,color:{argb:INK}};
+    nameCell.fill  = sf("FFFAF8F5");
+    nameCell.alignment = {horizontal:"left",vertical:"middle",indent:1};
+    r++;
+
+    // Category + Yield
+    ws.mergeCells(`A${r}:B${r}`);
+    ws.mergeCells(`C${r}:D${r}`);
+    const metaRow = ws.getRow(r);
+    metaRow.height = 18;
+    const catCell = metaRow.getCell(1);
+    catCell.value = "  " + (recipe.category||"");
+    catCell.font  = {name:"Calibri",size:9,bold:true,color:{argb:"FFFFFFFF"}};
+    catCell.fill  = sf(INK);
+    catCell.alignment = {vertical:"middle"};
+    const yldCell = metaRow.getCell(3);
+    yldCell.value = (recipe.yield_amount&&recipe.yield_unit)
+      ? "Yield: "+recipe.yield_amount+" "+recipe.yield_unit : "";
+    yldCell.font  = {name:"Calibri",size:9,italic:true,color:{argb:MID}};
+    yldCell.fill  = sf(SAND);
+    yldCell.alignment = {horizontal:"right",vertical:"middle",indent:1};
+    r++;
+
+    ws.getRow(r).height = 6; r++;
+
+    // Ingredients header
+    ws.mergeCells(`A${r}:D${r}`);
+    const ihRow = ws.getRow(r);
+    ihRow.height = 16;
+    const ihCell = ihRow.getCell(1);
+    ihCell.value = "INGREDIENTS";
+    ihCell.font  = {name:"Calibri",size:8,bold:true,color:{argb:GOLD}};
+    ihCell.fill  = sf(INK);
+    ihCell.alignment = {horizontal:"left",vertical:"middle",indent:1};
+    r++;
+
+    // Ingredient column sub-headers
+    const colHdrRow = ws.getRow(r);
+    colHdrRow.height = 15;
+    [["B","Ingredient"],["C","Amount"],["D","Unit"]].forEach(([col,label])=>{
+      const c = colHdrRow.getCell(col==="B"?2:col==="C"?3:4);
+      c.value = label;
+      c.font  = {name:"Calibri",size:8,bold:true,color:{argb:MID}};
+      c.fill  = sf(SAND);
+      c.alignment = {horizontal:col==="B"?"left":"right",vertical:"middle",indent:1};
+    });
+    r++;
+
+    // Ingredient rows
+    const ings = Array.isArray(recipe.ingredients)?recipe.ingredients:[];
+    ings.forEach((ing,i)=>{
+      const bg = i%2===0?ROW0:ROW1;
+      const ingRow = ws.getRow(r);
+      ingRow.height = 16;
+      [1,2,3,4].forEach(ci=>{ ingRow.getCell(ci).fill=sf(bg); });
+      const nameC = ingRow.getCell(2);
+      nameC.value = ing.name||"";
+      nameC.font  = {name:"Calibri",size:9,color:{argb:INK}};
+      nameC.alignment = {vertical:"middle",indent:1,wrapText:true};
+      nameC.border = thinBot(RULE);
+      const amtC = ingRow.getCell(3);
+      amtC.value = ing.amount||"";
+      amtC.font  = {name:"Calibri",size:9,bold:true,color:{argb:INK}};
+      amtC.alignment = {horizontal:"right",vertical:"middle",indent:1};
+      amtC.border = thinBot(RULE);
+      const unitC = ingRow.getCell(4);
+      unitC.value = ing.unit||"";
+      unitC.font  = {name:"Calibri",size:9,color:{argb:MID}};
+      unitC.alignment = {horizontal:"left",vertical:"middle",indent:1};
+      unitC.border = thinBot(RULE);
+      r++;
+    });
+
+    ws.getRow(r).height = 6; r++;
+
+    // Method header
+    ws.mergeCells(`A${r}:D${r}`);
+    const mhRow = ws.getRow(r);
+    mhRow.height = 16;
+    const mhCell = mhRow.getCell(1);
+    mhCell.value = "METHOD";
+    mhCell.font  = {name:"Calibri",size:8,bold:true,color:{argb:GOLD}};
+    mhCell.fill  = sf(INK);
+    mhCell.alignment = {horizontal:"left",vertical:"middle",indent:1};
+    r++;
+
+    // Method steps
+    const steps = Array.isArray(recipe.method)?recipe.method:[];
+    steps.forEach((step,i)=>{
+      const bg = i%2===0?ROW0:ROW1;
+      ws.mergeCells(`B${r}:D${r}`);
+      const stepRow = ws.getRow(r);
+      stepRow.height = 32;
+      const numC = stepRow.getCell(1);
+      numC.value = (i+1)+".";
+      numC.font  = {name:"Georgia",size:9,bold:true,color:{argb:GOLD}};
+      numC.fill  = sf(bg);
+      numC.alignment = {horizontal:"center",vertical:"top"};
+      const stepC = stepRow.getCell(2);
+      stepC.value = step||"";
+      stepC.font  = {name:"Calibri",size:9,color:{argb:INK}};
+      stepC.fill  = sf(bg);
+      stepC.alignment = {vertical:"top",wrapText:true,indent:1};
+      stepC.border = thinBot(RULE);
+      r++;
+    });
+
+    // End rule + gap
+    ws.mergeCells(`A${r}:D${r}`);
+    ws.getRow(r).getCell(1).fill = sf(RULE);
+    ws.getRow(r).height = 3; r++;
+    ws.getRow(r).height = 14; r++;
+  }
+
+  ws.views = [{state:"frozen",ySplit:3,activeCell:"A4",showGridLines:false}];
+
+  // Download
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename||"mise-recipes.xlsx";
+  a.click();
+  URL.revokeObjectURL(url);
+}
 const sbClient = window.supabase.createClient(SB_URL, SB_KEY, {
   auth: { persistSession: true, autoRefreshToken: true },
 });
@@ -1012,6 +1201,10 @@ function App(){
               <button style={st.btnP} onClick={()=>{setEdit(null);setShowForm(true);}}>+ New Recipe</button>
               <button style={st.btnGhost} onClick={()=>setShowCatMgr(true)}>Categories</button>
               <button style={st.btnGhost} onClick={()=>setShowUsers(true)}>Manage Access</button>
+              <button style={st.btnGhost} onClick={()=>{
+                const name = PROPERTY+"_recipes_"+new Date().toISOString().slice(0,10)+".xlsx";
+                exportToXlsx(recipes.filter(r=>!r._isDemo),name);
+              }}>↓ Export All</button>
             </>}
             <button style={st.btnGhost} onClick={handleSignOut} title={"Signed in as "+userEmail}>
               Sign out
@@ -1077,6 +1270,16 @@ function App(){
               </button>
             </div>
             <button style={st.btnGhost} onClick={exitBatchMode}>Cancel</button>
+            {batchSelected.length>0&&(
+              <button style={Object.assign({},st.btnGhost,{borderColor:C.accent,color:C.accent,flexShrink:"0"})}
+                onClick={()=>{
+                  const selected=recipes.filter(r=>batchSelected.includes(r.id));
+                  const name=PROPERTY+"_recipes_"+new Date().toISOString().slice(0,10)+".xlsx";
+                  exportToXlsx(selected,name);
+                }}>
+                ↓ Export ({batchSelected.length})
+              </button>
+            )}
           </div>
         )}
 
