@@ -308,7 +308,7 @@ async function dbPatchMany(table,ids,body){
   if(!r.ok) throw new Error("Batch update failed. Check connection.");
 }
 function fetchRecipes(){
-  return dbFetch("recipes?property=eq."+encodeURIComponent(PROPERTY)+"&order=category.asc,name.asc&select=*");
+  return dbFetch("recipes?property=eq."+encodeURIComponent(PROPERTY)+"&order=category.asc,name.asc&select=*&limit=5000");
 }
 
 // ── Magic link sender — calls edge function, never touches the allowlist ──────
